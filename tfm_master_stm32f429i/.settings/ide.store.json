@@ -1,0 +1,10 @@
+{
+  "source": {
+    "sourceType": "STM32CubeMX"
+  },
+  "board": "STM32F429I-DISC1",
+  "device": "STM32F429ZIT6",
+  "core": "Cortex-M4",
+  "order": 0,
+  "toolchain": "GCC"
+}

@@ -1,0 +1,17 @@
+# Build artifacts
+**/obj/
+**/bin/
+**/build/
+*.o
+*.ali
+*.a
+*.elf
+*.map
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
