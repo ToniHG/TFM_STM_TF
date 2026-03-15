@@ -30,10 +30,10 @@ typedef enum {
 /* ========================================================================= */
 
 typedef struct __attribute__((packed)) {
-    uint8_t  msg_type;      // Byte 0: Tipo de mensaje (msg_type_t)
-    uint8_t  seq_number;    // Byte 1: Número de secuencia (Algoritmo Tolerancia a Fallos 1)
-    uint32_t payload_data;  // Bytes 2-5: Los datos reales (ej. valor de un sensor o comando)
-    uint16_t crc16;         // Bytes 6-7: Checksum CRC16 (Algoritmo Tolerancia a Fallos 2)
+    uint8_t  msg_type       : 8;   // Byte 0: Tipo de mensaje (msg_type_t)
+    uint8_t  seq_number     : 8;   // Byte 1: Número de secuencia (Algoritmo Tolerancia a Fallos 1)
+    uint32_t payload_data   : 32;  // Bytes 2-5: Los datos reales (ej. valor de un sensor o comando)
+    uint16_t crc16          : 16;  // Bytes 6-7: Checksum CRC16 (Algoritmo Tolerancia a Fallos 2)
 } can_frame_payload_t;
 
 /* ========================================================================= */

@@ -19,11 +19,12 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "usb_host.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-
-/* USER CODE END Includes */
+#include "can_protocol.h"
+#include "fault_tolerance.h"
+#include <string.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
@@ -50,6 +51,9 @@ I2S_HandleTypeDef hi2s3;
 SPI_HandleTypeDef hspi1;
 
 /* USER CODE BEGIN PV */
+ft_context_t my_can_context; // Nuestra memoria de tolerancia a fallos
+can_frame_payload_t my_rx_frame; // Donde guardaremos lo que llega
+can_frame_payload_t my_tx_frame; // Donde preparamos lo que sale
 
 /* USER CODE END PV */
 
@@ -61,15 +65,13 @@ static void MX_I2C1_Init(void);
 static void MX_I2S3_Init(void);
 static void MX_SPI1_Init(void);
 void MX_USB_HOST_Process(void);
+void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_frame_payload_t *frame_to_send);
 
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
-
-/* USER CODE END 0 */
 
 /**
   * @brief  The application entry point.
@@ -77,27 +79,11 @@ void MX_USB_HOST_Process(void);
   */
 int main(void)
 {
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
   /* MCU Configuration--------------------------------------------------------*/
-
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
   /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_CAN1_Init();
@@ -105,20 +91,46 @@ int main(void)
   MX_I2S3_Init();
   MX_SPI1_Init();
   MX_USB_HOST_Init();
-  /* USER CODE BEGIN 2 */
-
-  /* USER CODE END 2 */
+  /* Initialize memory for Fault Tolerance can context */
+  ft_init_context(&my_can_context);
+  /* Configure  CAN filter to listen to all messages */
+  CAN_FilterTypeDef canfilterconfig;
+  canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
+  canfilterconfig.FilterBank = 0;  
+  canfilterconfig.FilterFIFOAssignment = CAN_RX_FIFO0;
+  canfilterconfig.FilterIdHigh = 0x0000;
+  canfilterconfig.FilterIdLow = 0x0000;
+  canfilterconfig.FilterMaskIdHigh = 0x0000;
+  canfilterconfig.FilterMaskIdLow = 0x0000;
+  canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
+  canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
+  canfilterconfig.SlaveStartFilterBank = 14;
+  /* Initialize CAN filter and interrupts for reception */
+  if (HAL_CAN_ConfigFilter(&hcan1, &canfilterconfig) != HAL_OK) {
+      Error_Handler();
+  }
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+      Error_Handler();
+  }
+  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
+      Error_Handler();
+  }
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* USER CODE END WHILE */
     MX_USB_HOST_Process();
 
-    /* USER CODE BEGIN 3 */
+    /* 1. Fill data with sensor values */
+    can_proto_pack_sensor_data(&my_tx_frame, 2048); 
+
+    /* 2. Send message safely to the bus
+      (If slave using &hcan1, if you are in the Master use &hcan2) */
+    CAN_Safe_Transmit(&hcan1, CAN_ID_SLAVE_TELEMETRY, &my_tx_frame);
+
+    /* 3. Wait 1 second for the next transmission */
+    HAL_Delay(1000);
   }
-  /* USER CODE END 3 */
 }
 
 /**
@@ -173,14 +185,6 @@ void SystemClock_Config(void)
   */
 static void MX_CAN1_Init(void)
 {
-
-  /* USER CODE BEGIN CAN1_Init 0 */
-
-  /* USER CODE END CAN1_Init 0 */
-
-  /* USER CODE BEGIN CAN1_Init 1 */
-
-  /* USER CODE END CAN1_Init 1 */
   hcan1.Instance = CAN1;
   hcan1.Init.Prescaler = 6;
   hcan1.Init.Mode = CAN_MODE_NORMAL;
@@ -197,10 +201,6 @@ static void MX_CAN1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN CAN1_Init 2 */
-
-  /* USER CODE END CAN1_Init 2 */
-
 }
 
 /**
@@ -210,14 +210,6 @@ static void MX_CAN1_Init(void)
   */
 static void MX_I2C1_Init(void)
 {
-
-  /* USER CODE BEGIN I2C1_Init 0 */
-
-  /* USER CODE END I2C1_Init 0 */
-
-  /* USER CODE BEGIN I2C1_Init 1 */
-
-  /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -231,10 +223,6 @@ static void MX_I2C1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN I2C1_Init 2 */
-
-  /* USER CODE END I2C1_Init 2 */
-
 }
 
 /**
@@ -244,14 +232,6 @@ static void MX_I2C1_Init(void)
   */
 static void MX_I2S3_Init(void)
 {
-
-  /* USER CODE BEGIN I2S3_Init 0 */
-
-  /* USER CODE END I2S3_Init 0 */
-
-  /* USER CODE BEGIN I2S3_Init 1 */
-
-  /* USER CODE END I2S3_Init 1 */
   hi2s3.Instance = SPI3;
   hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
   hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
@@ -265,10 +245,6 @@ static void MX_I2S3_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN I2S3_Init 2 */
-
-  /* USER CODE END I2S3_Init 2 */
-
 }
 
 /**
@@ -278,14 +254,6 @@ static void MX_I2S3_Init(void)
   */
 static void MX_SPI1_Init(void)
 {
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
   /* SPI1 parameter configuration*/
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_MASTER;
@@ -303,10 +271,6 @@ static void MX_SPI1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
 }
 
 /**
@@ -317,10 +281,6 @@ static void MX_SPI1_Init(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
-
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -328,31 +288,25 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin, GPIO_PIN_RESET);
-
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
-
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
                           |Audio_RST_Pin, GPIO_PIN_RESET);
-
   /*Configure GPIO pin : CS_I2C_SPI_Pin */
   GPIO_InitStruct.Pin = CS_I2C_SPI_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(CS_I2C_SPI_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
   GPIO_InitStruct.Pin = OTG_FS_PowerSwitchOn_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(OTG_FS_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pin : PDM_OUT_Pin */
   GPIO_InitStruct.Pin = PDM_OUT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -360,19 +314,16 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
   HAL_GPIO_Init(PDM_OUT_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pin : BOOT1_Pin */
   GPIO_InitStruct.Pin = BOOT1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pin : CLK_IN_Pin */
   GPIO_InitStruct.Pin = CLK_IN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -380,7 +331,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
   HAL_GPIO_Init(CLK_IN_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin
                            Audio_RST_Pin */
   GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
@@ -389,27 +339,94 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-
   /*Configure GPIO pin : OTG_FS_OverCurrent_Pin */
   GPIO_InitStruct.Pin = OTG_FS_OverCurrent_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(OTG_FS_OverCurrent_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pin : MEMS_INT2_Pin */
   GPIO_InitStruct.Pin = MEMS_INT2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+/* USER CODE BEGIN 4 */
 
-/* USER CODE END 4 */
+/**
+ * @brief  Función universal para enviar tramas seguras al bus CAN
+ * @param  hcan: Puntero al periférico CAN (&hcan1 en Esclavo, &hcan2 en Master)
+ * @param  target_can_id: El ID del mensaje (ej. CAN_ID_MASTER_CMD o CAN_ID_SLAVE_TELEMETRY)
+ * @param  frame_to_send: Puntero a la estructura ya rellenada con tus datos
+ */
+void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_frame_payload_t *frame_to_send) {
+    CAN_TxHeaderTypeDef tx_header;
+    uint32_t tx_mailbox;
+    uint8_t tx_data[8];
+
+    // 1. Configurar la cabecera hardware
+    tx_header.StdId = target_can_id; 
+    tx_header.ExtId = 0;
+    tx_header.IDE = CAN_ID_STD;
+    tx_header.RTR = CAN_RTR_DATA;
+    tx_header.DLC = 8; // Siempre 8 bytes
+    tx_header.TransmitGlobalTime = DISABLE;
+
+    // 2. Aplicar Tolerancia a Fallos (Secuencia + CRC)
+    ft_prepare_tx_frame(frame_to_send, &my_can_context);
+
+    // 3. Pasar nuestra estructura al buffer crudo del hardware
+    memcpy(tx_data, frame_to_send, sizeof(can_frame_payload_t));
+
+    // 4. Inyectar al bus
+    if (HAL_CAN_AddTxMessage(hcan, &tx_header, tx_data, &tx_mailbox) != HAL_OK) {
+        // Podrías encender un LED de error de hardware aquí
+        Error_Handler();
+    }
+}
+
+/**
+ * @brief  Callback universal de Recepción (Salta automáticamente al llegar un mensaje)
+ */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+    CAN_RxHeaderTypeDef rx_header;
+    uint8_t rx_data[8];
+
+    // Sacamos el mensaje del buzón del hardware
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK) {
+        
+        // Lo pasamos a nuestra estructura
+        memcpy(&my_rx_frame, rx_data, sizeof(can_frame_payload_t));
+
+        // ¡VERIFICACIÓN DE SEGURIDAD!
+        ft_status_t status = ft_verify_rx_frame(&my_rx_frame, &my_can_context);
+
+        if (status == FT_OK) {
+            // ✅ Trama perfecta. Aquí metes tu lógica (ej. leer el sensor o procesar comando)
+            
+            // Si eres el Máster y recibes telemetría del esclavo:
+            if (rx_header.StdId == CAN_ID_SLAVE_TELEMETRY) {
+                // Actualizar la pantalla LCD con: my_rx_frame.payload_data
+            }
+
+        } else if (status == FT_ERR_CRC_FAILED) {
+            // ❌ Error grave: Datos corruptos por ruido eléctrico
+            my_can_context.stats_crc_errors++;
+            
+        } else if (status == FT_ERR_FRAME_LOST) {
+            // ⚠️ Advertencia: Nos hemos perdido mensajes por el camino
+            my_can_context.stats_frames_lost++;
+        }
+    }
+}
+
+/**
+ * @brief  Callback de interrupción: Confirma que el envío terminó con éxito
+ */
+void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef *hcan) {
+    // Aquí puedes poner un toggle de un LED verde para saber que el cableado está bien
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.

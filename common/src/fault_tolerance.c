@@ -16,7 +16,7 @@ ft_status_t ft_prepare_tx_frame(can_frame_payload_t *frame, ft_context_t *ctx) {
     ctx->tx_seq_num++; // Al llegar a 255, volverá a 0 automáticamente (uint8_t)
 
     // 2. Calcular los bytes útiles (todo lo que hay antes del campo crc16)
-    size_t data_length = offsetof(can_frame_payload_t, crc16);
+    size_t data_length = sizeof(can_frame_payload_t) - sizeof(uint16_t);
 
     // 3. Calcular e insertar el CRC (Algoritmo 2)
     frame->crc16 = calculate_crc16((const uint8_t *)frame, data_length);
@@ -28,7 +28,7 @@ ft_status_t ft_verify_rx_frame(const can_frame_payload_t *frame, ft_context_t *c
     // ---------------------------------------------------------------------
     // PASO 1: VERIFICAR INTEGRIDAD (CRC) - ¡Siempre se hace primero!
     // ---------------------------------------------------------------------
-    size_t data_length = offsetof(can_frame_payload_t, crc16);
+    size_t data_length = sizeof(can_frame_payload_t) - sizeof(uint16_t);
     uint16_t calculated_crc = calculate_crc16((const uint8_t *)frame, data_length);
 
     if (calculated_crc != frame->crc16) {

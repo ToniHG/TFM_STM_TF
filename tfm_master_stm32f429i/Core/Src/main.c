@@ -18,12 +18,16 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <string.h>
+#include <stdio.h>
 #include "cmsis_os.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-
-/* USER CODE END Includes */
+#include "can_protocol.h"
+#include "fault_tolerance.h"
+#include "stm32f429i_discovery_lcd.h"
+#include "stm32f429i_discovery_sdram.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
@@ -60,16 +64,16 @@ UART_HandleTypeDef huart1;
 SDRAM_HandleTypeDef hsdram1;
 
 osThreadId defaultTaskHandle;
-/* USER CODE BEGIN Includes */
-#include "can_protocol.h"
-#include "fault_tolerance.h"
-#include <string.h> // Para memcpy
-/* USER CODE END Includes */
 
 /* USER CODE BEGIN PV */
 ft_context_t my_can_context; // Nuestra memoria de tolerancia a fallos
 can_frame_payload_t my_rx_frame; // Donde guardaremos lo que llega
 can_frame_payload_t my_tx_frame; // Donde preparamos lo que sale
+volatile uint8_t flag_update_display = 0;
+volatile ft_status_t last_msg_status = FT_OK;
+QueueHandle_t can_rx_queue;      // Nuestro buzón seguro para mensajes CAN
+TaskHandle_t TaskProcess_Handle; // Ticket de la tarea procesadora
+TaskHandle_t TaskDisplay_Handle;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -84,105 +88,99 @@ static void MX_LTDC_Init(void);
 static void MX_SPI5_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_USART1_UART_Init(void);
-void StartDefaultTask(void const * argument);
-
-/* USER CODE BEGIN PFP */
-
-/* USER CODE END PFP */
+static void MX_LCD_Display_Init(void);
+void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_frame_payload_t *frame_to_send);
+void Task_ProcessData(void *argument);
+void Task_UpdateDisplay(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
-
-/* USER CODE END 0 */
-
 /**
   * @brief  The application entry point.
   * @retval int
   */
 int main(void)
 {
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
   /* MCU Configuration--------------------------------------------------------*/
-
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
   /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_CAN2_Init();
   MX_CRC_Init();
-  MX_DMA2D_Init();
-  MX_FMC_Init();
   MX_I2C3_Init();
-  MX_LTDC_Init();
-  MX_SPI5_Init();
   MX_TIM1_Init();
   MX_USART1_UART_Init();
-  /* USER CODE BEGIN 2 */
-
-  /* USER CODE END 2 */
-
-  /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
-  /* USER CODE END RTOS_MUTEX */
-
-  /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
-  /* USER CODE END RTOS_SEMAPHORES */
-
-  /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
-  /* USER CODE END RTOS_TIMERS */
-
-  /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
-  /* USER CODE END RTOS_QUEUES */
-
+  MX_LCD_Display_Init();
+  /* Initialize memory for Fault Tolerance can context */
+  ft_init_context(&my_can_context);
   /* Create the thread(s) */
-  /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 4096);
-  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
-
-  /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
-  /* USER CODE END RTOS_THREADS */
-
+  /* Create the queue for CAN messages */
+  can_rx_queue = xQueueCreate(10, sizeof(can_frame_payload_t));
+  /* Create the task for processing CAN messages high priority */
+  xTaskCreate(Task_ProcessData, "Procesador", 256, NULL, 2, &TaskProcess_Handle);
+  /* Create the task for updating the display low priority */
+  xTaskCreate(Task_UpdateDisplay, "Pantalla", 256, NULL, 1, &TaskDisplay_Handle);
   /* Start scheduler */
-  osKernelStart();
+  vTaskStartScheduler();
 
-  /* We should never get here as control is now taken by the scheduler */
+  /* Temporal buffer for display data */
+  char lcd_buffer[50]; 
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
     /* Main code for master */
-    // 1. Rellenamos la trama con un dato útil usando nuestras funciones de common/
+    /* If a new message has arrived that requires updating the display */
+    if (flag_update_display == 1) { 
+      /* Show data */
+      sprintf(lcd_buffer, " DATO: %lu     ", my_rx_frame.payload_data);
+      BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+      BSP_LCD_DisplayStringAtLine(3, (uint8_t *)lcd_buffer);
+
+      /* Show sequence number */
+      sprintf(lcd_buffer, " SECUENCIA: %u  ", my_rx_frame.seq_number);
+      BSP_LCD_SetTextColor(LCD_COLOR_LIGHTBLUE);
+      BSP_LCD_DisplayStringAtLine(4, (uint8_t *)lcd_buffer);
+
+      /* Check message status */
+      if (last_msg_status == FT_OK) {
+          BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
+          BSP_LCD_DisplayStringAtLine(6, (uint8_t *)" ESTADO: OK       ");
+      } 
+      else if (last_msg_status == FT_ERR_CRC_FAILED) {
+          BSP_LCD_SetTextColor(LCD_COLOR_RED);
+          BSP_LCD_DisplayStringAtLine(6, (uint8_t *)" ERROR: CRC FAIL  ");
+      }
+      else if (last_msg_status == FT_ERR_FRAME_LOST) {
+          BSP_LCD_SetTextColor(LCD_COLOR_ORANGE);
+          BSP_LCD_DisplayStringAtLine(6, (uint8_t *)" ERROR: FRAME LOST");
+      }
+
+      /* Show fault statistics */
+      sprintf(lcd_buffer, " Faults CRC: %lu ", my_can_context.stats_crc_errors);
+      BSP_LCD_SetTextColor(LCD_COLOR_RED);
+      BSP_LCD_DisplayStringAtLine(8, (uint8_t *)lcd_buffer);
+
+      sprintf(lcd_buffer, " Losts packages: %lu   ", my_can_context.stats_frames_lost);
+      BSP_LCD_SetTextColor(LCD_COLOR_ORANGE);
+      BSP_LCD_DisplayStringAtLine(9, (uint8_t *)lcd_buffer);
+
+      /* Update display flag */
+      flag_update_display = 0;
+    }
+
+    /* Fill data with sensor values */
     can_proto_pack_sensor_data(&my_tx_frame, 2048); 
 
-    // 2. La enviamos indicando quiénes somos y nuestro periférico
-    // (Si estás en el Esclavo usas &hcan1, si estás en el Master usas &hcan2)
-    CAN_Safe_Transmit(&hcan2, CAN_ID_SLAVE_TELEMETRY, &my_tx_frame);
+    /* Send message safely to the bus
+      (If slave using &hcan1, if you are in the Master use &hcan2) */
+    CAN_Safe_Transmit(&hcan2, CAN_ID_MASTER_CMD, &my_tx_frame);
 
-    // Esperamos 1 segundo
+    /* Wait 1 second for the next transmission */
     HAL_Delay(1000);
   }
-  /* USER CODE END 3 */
 }
 
 /**
@@ -206,7 +204,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLM = 16;
   RCC_OscInitStruct.PLL.PLLN = 180;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 3;
@@ -244,14 +242,7 @@ void SystemClock_Config(void)
   */
 static void MX_CAN2_Init(void)
 {
-
-  /* USER CODE BEGIN CAN2_Init 0 */
-
-  /* USER CODE END CAN2_Init 0 */
-
-  /* USER CODE BEGIN CAN2_Init 1 */
-
-  /* USER CODE END CAN2_Init 1 */
+  /* Configure CAN2 */
   hcan2.Instance = CAN2;
   hcan2.Init.Prescaler = 9;
   hcan2.Init.Mode = CAN_MODE_NORMAL;
@@ -264,14 +255,34 @@ static void MX_CAN2_Init(void)
   hcan2.Init.AutoRetransmission = DISABLE;
   hcan2.Init.ReceiveFifoLocked = DISABLE;
   hcan2.Init.TransmitFifoPriority = DISABLE;
+  /* Configure  CAN filter to listen to all messages */
+  CAN_FilterTypeDef canfilterconfig;
+  canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
+  canfilterconfig.FilterBank = 14;
+  canfilterconfig.FilterFIFOAssignment = CAN_RX_FIFO0;
+  canfilterconfig.FilterIdHigh = 0x0000;
+  canfilterconfig.FilterIdLow = 0x0000;
+  canfilterconfig.FilterMaskIdHigh = 0x0000;
+  canfilterconfig.FilterMaskIdLow = 0x0000;
+  canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
+  canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
+  canfilterconfig.SlaveStartFilterBank = 14;
+
+  /* Initialize CAN */
   if (HAL_CAN_Init(&hcan2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN CAN2_Init 2 */
-
-  /* USER CODE END CAN2_Init 2 */
-
+  /* Initialize CAN filter and interrupts for reception */
+  if (HAL_CAN_ConfigFilter(&hcan2, &canfilterconfig) != HAL_OK) {
+      Error_Handler();
+  }
+  if (HAL_CAN_Start(&hcan2) != HAL_OK) {
+      Error_Handler();
+  }
+  if (HAL_CAN_ActivateNotification(&hcan2, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
+      Error_Handler();
+  }
 }
 
 /**
@@ -281,23 +292,11 @@ static void MX_CAN2_Init(void)
   */
 static void MX_CRC_Init(void)
 {
-
-  /* USER CODE BEGIN CRC_Init 0 */
-
-  /* USER CODE END CRC_Init 0 */
-
-  /* USER CODE BEGIN CRC_Init 1 */
-
-  /* USER CODE END CRC_Init 1 */
   hcrc.Instance = CRC;
   if (HAL_CRC_Init(&hcrc) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN CRC_Init 2 */
-
-  /* USER CODE END CRC_Init 2 */
-
 }
 
 /**
@@ -307,14 +306,6 @@ static void MX_CRC_Init(void)
   */
 static void MX_DMA2D_Init(void)
 {
-
-  /* USER CODE BEGIN DMA2D_Init 0 */
-
-  /* USER CODE END DMA2D_Init 0 */
-
-  /* USER CODE BEGIN DMA2D_Init 1 */
-
-  /* USER CODE END DMA2D_Init 1 */
   hdma2d.Instance = DMA2D;
   hdma2d.Init.Mode = DMA2D_M2M;
   hdma2d.Init.ColorMode = DMA2D_OUTPUT_ARGB8888;
@@ -331,10 +322,6 @@ static void MX_DMA2D_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN DMA2D_Init 2 */
-
-  /* USER CODE END DMA2D_Init 2 */
-
 }
 
 /**
@@ -344,14 +331,6 @@ static void MX_DMA2D_Init(void)
   */
 static void MX_I2C3_Init(void)
 {
-
-  /* USER CODE BEGIN I2C3_Init 0 */
-
-  /* USER CODE END I2C3_Init 0 */
-
-  /* USER CODE BEGIN I2C3_Init 1 */
-
-  /* USER CODE END I2C3_Init 1 */
   hi2c3.Instance = I2C3;
   hi2c3.Init.ClockSpeed = 100000;
   hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -379,10 +358,6 @@ static void MX_I2C3_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN I2C3_Init 2 */
-
-  /* USER CODE END I2C3_Init 2 */
-
 }
 
 /**
@@ -513,16 +488,9 @@ static void MX_SPI5_Init(void)
 static void MX_TIM1_Init(void)
 {
 
-  /* USER CODE BEGIN TIM1_Init 0 */
-
-  /* USER CODE END TIM1_Init 0 */
-
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE BEGIN TIM1_Init 1 */
-
-  /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 0;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -545,10 +513,6 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM1_Init 2 */
-
-  /* USER CODE END TIM1_Init 2 */
-
 }
 
 /**
@@ -558,14 +522,6 @@ static void MX_TIM1_Init(void)
   */
 static void MX_USART1_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -578,25 +534,12 @@ static void MX_USART1_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
-
 }
 
 /* FMC initialization function */
 static void MX_FMC_Init(void)
 {
-
-  /* USER CODE BEGIN FMC_Init 0 */
-
-  /* USER CODE END FMC_Init 0 */
-
   FMC_SDRAM_TimingTypeDef SdramTiming = {0};
-
-  /* USER CODE BEGIN FMC_Init 1 */
-
-  /* USER CODE END FMC_Init 1 */
 
   /** Perform the SDRAM1 memory initialization sequence
   */
@@ -626,9 +569,6 @@ static void MX_FMC_Init(void)
     Error_Handler( );
   }
 
-  /* USER CODE BEGIN FMC_Init 2 */
-
-  /* USER CODE END FMC_Init 2 */
 }
 
 /**
@@ -639,10 +579,6 @@ static void MX_FMC_Init(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
-
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
@@ -652,51 +588,41 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOG_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, NCS_MEMS_SPI_Pin|CSX_Pin|OTG_FS_PSO_Pin, GPIO_PIN_RESET);
-
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(ACP_RST_GPIO_Port, ACP_RST_Pin, GPIO_PIN_RESET);
-
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, RDX_Pin|WRX_DCX_Pin, GPIO_PIN_RESET);
-
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOG, LD3_Pin|LD4_Pin, GPIO_PIN_RESET);
-
   /*Configure GPIO pins : NCS_MEMS_SPI_Pin CSX_Pin OTG_FS_PSO_Pin */
   GPIO_InitStruct.Pin = NCS_MEMS_SPI_Pin|CSX_Pin|OTG_FS_PSO_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
   /*Configure GPIO pins : B1_Pin MEMS_INT1_Pin MEMS_INT2_Pin TP_INT1_Pin */
   GPIO_InitStruct.Pin = B1_Pin|MEMS_INT1_Pin|MEMS_INT2_Pin|TP_INT1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
   /*Configure GPIO pin : ACP_RST_Pin */
   GPIO_InitStruct.Pin = ACP_RST_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(ACP_RST_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pin : OTG_FS_OC_Pin */
   GPIO_InitStruct.Pin = OTG_FS_OC_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(OTG_FS_OC_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pin : BOOT1_Pin */
   GPIO_InitStruct.Pin = BOOT1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pins : OTG_HS_DM_Pin OTG_HS_DP_Pin */
   GPIO_InitStruct.Pin = OTG_HS_DM_Pin|OTG_HS_DP_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -704,34 +630,53 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   GPIO_InitStruct.Alternate = GPIO_AF12_OTG_HS_FS;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
   /*Configure GPIO pin : TE_Pin */
   GPIO_InitStruct.Pin = TE_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(TE_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pins : RDX_Pin WRX_DCX_Pin */
   GPIO_InitStruct.Pin = RDX_Pin|WRX_DCX_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-
   /*Configure GPIO pins : LD3_Pin LD4_Pin */
   GPIO_InitStruct.Pin = LD3_Pin|LD4_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
-/* USER CODE BEGIN 4 */
-/* USER CODE BEGIN 4 */
+/**
+  * @brief LCD_Display Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_LCD_Display_Init(void)
+{
+  /* Initialize SDRAM */
+  BSP_SDRAM_Init();
+  /* Initialize LCD panel display*/
+  BSP_LCD_Init();
+  /* Configure LCD layers to external SDRAM */
+  BSP_LCD_LayerDefaultInit(1, 0xD0000000);
+  /* Select the configured layer */
+  BSP_LCD_SelectLayer(1);
+  /* Draw the initial screen */
+  BSP_LCD_Clear(LCD_COLOR_BLACK);
+  /* Configure text properties */
+  BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
+  BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
+  BSP_LCD_SetFont(&Font20);
+  /* Display initial strings */
+  BSP_LCD_DisplayStringAtLine(1, (uint8_t *)"  TFM TOLERANCIA    ");
+  BSP_LCD_DisplayStringAtLine(2, (uint8_t *)"     A FALLOS       ");
+  /* Display waiting message */
+  BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+  BSP_LCD_DisplayStringAtLine(5, (uint8_t *)" ESPERANDO DATOS... ");
+}
 
 /**
  * @brief  Función universal para enviar tramas seguras al bus CAN
@@ -739,65 +684,50 @@ static void MX_GPIO_Init(void)
  * @param  target_can_id: El ID del mensaje (ej. CAN_ID_MASTER_CMD o CAN_ID_SLAVE_TELEMETRY)
  * @param  frame_to_send: Puntero a la estructura ya rellenada con tus datos
  */
-void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_frame_payload_t *frame_to_send) {
-    CAN_TxHeaderTypeDef tx_header;
-    uint32_t tx_mailbox;
-    uint8_t tx_data[8];
+void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_frame_payload_t *frame_to_send) 
+{
+  CAN_TxHeaderTypeDef tx_header;
+  uint32_t tx_mailbox;
+  uint8_t tx_data[8];
 
-    // 1. Configurar la cabecera hardware
-    tx_header.StdId = target_can_id; 
-    tx_header.ExtId = 0;
-    tx_header.IDE = CAN_ID_STD;
-    tx_header.RTR = CAN_RTR_DATA;
-    tx_header.DLC = 8; // Siempre 8 bytes
-    tx_header.TransmitGlobalTime = DISABLE;
-
-    // 2. Aplicar Tolerancia a Fallos (Secuencia + CRC)
-    ft_prepare_tx_frame(frame_to_send, &my_can_context);
-
-    // 3. Pasar nuestra estructura al buffer crudo del hardware
-    memcpy(tx_data, frame_to_send, sizeof(can_frame_payload_t));
-
-    // 4. Inyectar al bus
-    if (HAL_CAN_AddTxMessage(hcan2, &tx_header, tx_data, &tx_mailbox) != HAL_OK) {
-        // Podrías encender un LED de error de hardware aquí
-        Error_Handler();
-    }
+  // 1. Configure CAN Header
+  tx_header.StdId = target_can_id; 
+  tx_header.ExtId = 0;
+  tx_header.IDE = CAN_ID_STD;
+  tx_header.RTR = CAN_RTR_DATA;
+  tx_header.DLC = 8; // Siempre 8 bytes
+  tx_header.TransmitGlobalTime = DISABLE;
+  // 2. Treat our frame with the Fault Tolerance library to add CRC and sequence number
+  ft_prepare_tx_frame(frame_to_send, &my_can_context);
+  // 3. Add data to the CAN payload
+  memcpy(tx_data, frame_to_send, sizeof(can_frame_payload_t));
+  // 4. Transmit the message and check for errors
+  if (HAL_CAN_AddTxMessage(&hcan2, &tx_header, tx_data, &tx_mailbox) != HAL_OK) {
+      // Podrías encender un LED de error de hardware aquí
+      Error_Handler();
+  }
 }
 
 /**
  * @brief  Callback universal de Recepción (Salta automáticamente al llegar un mensaje)
+ * @param  hcan: Puntero al periférico CAN que ha recibido el mensaje (ej. &hcan1 o &hcan2)
+ * @retval None
  */
-void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan) {
-    CAN_RxHeaderTypeDef rx_header;
-    uint8_t rx_data[8];
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) 
+{
+  CAN_RxHeaderTypeDef rx_header;
+  uint8_t rx_data[8];can_frame_payload_t incoming_msg;
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-    // Sacamos el mensaje del buzón del hardware
-    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK) {
-        
-        // Lo pasamos a nuestra estructura
-        memcpy(&my_rx_frame, rx_data, sizeof(can_frame_payload_t));
-
-        // ¡VERIFICACIÓN DE SEGURIDAD!
-        ft_status_t status = ft_verify_rx_frame(&my_rx_frame, &my_can_context);
-
-        if (status == FT_OK) {
-            // ✅ Trama perfecta. Aquí metes tu lógica (ej. leer el sensor o procesar comando)
-            
-            // Si eres el Máster y recibes telemetría del esclavo:
-            if (rx_header.StdId == CAN_ID_SLAVE_TELEMETRY) {
-                // Actualizar la pantalla LCD con: my_rx_frame.payload_data
-            }
-
-        } else if (status == FT_ERR_CRC_FAILED) {
-            // ❌ Error grave: Datos corruptos por ruido eléctrico
-            my_can_context.stats_crc_errors++;
-            
-        } else if (status == FT_ERR_FRAME_LOST) {
-            // ⚠️ Advertencia: Nos hemos perdido mensajes por el camino
-            my_can_context.stats_frames_lost++;
-        }
-    }
+  /* Get the received message from the CAN peripheral */
+  if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK) {
+      
+    /* Copy received data to our frame structure */
+    memcpy(&my_rx_frame, rx_data, sizeof(can_frame_payload_t));
+    /* Send the received message to the FreeRTOS queue */
+    xQueueSendFromISR(can_rx_queue, &incoming_msg, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  }
 }
 
 /**
@@ -807,25 +737,42 @@ void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef *hcan) {
     // Aquí puedes poner un toggle de un LED verde para saber que el cableado está bien
 }
 
-/* USER CODE END 4 */
-/* USER CODE END 4 */
-
-/* USER CODE BEGIN Header_StartDefaultTask */
 /**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void const * argument)
+ * @brief  Task de FreeRTOS para procesar los mensajes recibidos del bus CAN
+ * @param  argument: No se usa, pero es un puntero que podrías usar para pasar datos a la tarea si quisieras
+ * @retval None
+ */
+void Task_ProcessData(void *argument) 
 {
-  /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END 5 */
+    can_frame_payload_t msg_to_process;
+
+    while(1) {
+        /* Wait for a message to be received on the CAN queue */
+        if (xQueueReceive(can_rx_queue, &msg_to_process, portMAX_DELAY) == pdPASS) {
+            
+            // ¡AQUÍ ENTRAREMOS EN EL FUTURO!
+            // Identificaremos el esclavo, calcularemos CRC, aplicaremos los castigos...
+            
+            // De momento, solo probamos que el OS funciona
+            // last_msg_status = ft_verify_rx_frame(&msg_to_process, &my_can_context);
+        }
+    }
+}
+
+/**
+ * @brief  Task de FreeRTOS para actualizar la pantalla
+ * @param  argument: No se usa, pero es un puntero que podrías usar para pasar datos a la tarea si quisieras
+ * @retval None
+ */
+void Task_UpdateDisplay(void *argument) 
+{
+    while(1) {
+        /* Wait for the specified delay */
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        // Aquí pondremos los sprintf y BSP_LCD_DisplayStringAtLine
+        // usando los datos seguros ya validados por el Procesador
+    }
 }
 
 /**

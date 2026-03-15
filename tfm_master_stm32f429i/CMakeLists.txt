@@ -42,18 +42,29 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
 )
 
+# Define the path to the STM32CubeF4 firmware package
+set(ST_FW "C:/Users/tonih/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3")
+
+# Add include paths
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+    # Add user defined include paths
+    ../common/inc
+    ${ST_FW}/Drivers/BSP/STM32F429I-Discovery
+    ${ST_FW}/Drivers/BSP/Components/ili9341
+    ${ST_FW}/Drivers/BSP/Components/Common
+    ${ST_FW}/Utilities/Fonts
+)
+
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     ../common/src/can_protocol.c
     ../common/src/crc16.c
     ../common/src/fault_tolerance.c
-)
-
-# Add include paths
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined include paths
-    ../common/inc
+    ${ST_FW}/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery.c
+    ${ST_FW}/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_lcd.c
+    ${ST_FW}/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_sdram.c
+    ${ST_FW}/Drivers/BSP/Components/ili9341/ili9341.c
 )
 
 # Add project symbols (macros)
