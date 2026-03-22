@@ -25,6 +25,7 @@
 #include "fault_tolerance.h"
 #include "stm32f429i_discovery_lcd.h"
 #include "stm32f429i_discovery_sdram.h"
+#include "stm32f429i_discovery_ts.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
@@ -45,36 +46,38 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-CAN_HandleTypeDef hcan2;
+CAN_HandleTypeDef hcan2;                      // Handle for CAN2 (used as Master in this example)
+CRC_HandleTypeDef hcrc;                       // Handle for CRC (used for CRC16 calculation in fault tolerance)
+DMA2D_HandleTypeDef hdma2d;                   // Handle for DMA2D (used for efficient LCD updates)
+I2C_HandleTypeDef hi2c3;                      // Handle for I2C3 (used for touch screen, if needed)
+LTDC_HandleTypeDef hltdc;                     // Handle for LTDC (used for driving the LCD)
+SPI_HandleTypeDef hspi5;                      // Handle for SPI5 (used for the SD card, if needed)
+TIM_HandleTypeDef htim1;                      // Handle for TIM1 (used for timing, if needed)
+UART_HandleTypeDef huart1;                    // Handle for UART (used for debugging, e.g. with printf)
+SDRAM_HandleTypeDef hsdram1;                  // Handle for SDRAM (used by the LCD)
+can_frame_payload_t my_rx_frame;              // To store the last received frame for display purposes 
+can_frame_payload_t my_tx_frame;              // To prepare the frame we want to send (e.g. with sensor data) 
+volatile uint8_t flag_update_display = 0;     // Flag to indicate that the display needs to be updated with new data
+volatile ft_status_t last_msg_status = FT_OK; // Status of the last processed message (for display purposes)
+QueueHandle_t can_rx_queue;                   // FreeRTOS queue to receive CAN messages from the ISR
+TaskHandle_t TaskProcess_Handle;              // Handle for the task that processes CAN messages
+TaskHandle_t TaskDisplay_Handle;              // Handle for the task that updates the display
+/* Structure for RTOS CAN messages */
+typedef struct {
+    uint32_t sender_id;
+    can_frame_payload_t frame;
+} rtos_can_msg_t;
+/* Enum for GUI states */
+typedef enum {
+    DISPLAY_MAIN = 0,
+    DISPLAY_NODE_1,
+    DISPLAY_NODE_2,
+    DISPLAY_NODE_3,
+    DISPLAY_CONTROL
+} estado_gui_t;
+estado_gui_t actual_display = DISPLAY_MAIN;  // Variable to track the current screen being displayed
+uint8_t update_display = 1;                 // Flag to force repainting the screen when changing states
 
-CRC_HandleTypeDef hcrc;
-
-DMA2D_HandleTypeDef hdma2d;
-
-I2C_HandleTypeDef hi2c3;
-
-LTDC_HandleTypeDef hltdc;
-
-SPI_HandleTypeDef hspi5;
-
-TIM_HandleTypeDef htim1;
-
-UART_HandleTypeDef huart1;
-
-SDRAM_HandleTypeDef hsdram1;
-
-osThreadId defaultTaskHandle;
-
-/* USER CODE BEGIN PV */
-ft_context_t my_can_context; // Nuestra memoria de tolerancia a fallos
-can_frame_payload_t my_rx_frame; // Donde guardaremos lo que llega
-can_frame_payload_t my_tx_frame; // Donde preparamos lo que sale
-volatile uint8_t flag_update_display = 0;
-volatile ft_status_t last_msg_status = FT_OK;
-QueueHandle_t can_rx_queue;      // Nuestro buzón seguro para mensajes CAN
-TaskHandle_t TaskProcess_Handle; // Ticket de la tarea procesadora
-TaskHandle_t TaskDisplay_Handle;
-/* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -98,8 +101,7 @@ void Task_UpdateDisplay(void *argument);
   * @brief  The application entry point.
   * @retval int
   */
-int main(void)
-{
+int main(void) {
   /* MCU Configuration--------------------------------------------------------*/
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
@@ -114,72 +116,20 @@ int main(void)
   MX_USART1_UART_Init();
   MX_LCD_Display_Init();
   /* Initialize memory for Fault Tolerance can context */
-  ft_init_context(&my_can_context);
-  /* Create the thread(s) */
+  ft_init_context();
   /* Create the queue for CAN messages */
   can_rx_queue = xQueueCreate(10, sizeof(can_frame_payload_t));
   /* Create the task for processing CAN messages high priority */
-  xTaskCreate(Task_ProcessData, "Procesador", 256, NULL, 2, &TaskProcess_Handle);
+  xTaskCreate(Task_ProcessData, "Proccesador", 256, NULL, 2, &TaskProcess_Handle);
   /* Create the task for updating the display low priority */
-  xTaskCreate(Task_UpdateDisplay, "Pantalla", 256, NULL, 1, &TaskDisplay_Handle);
+  xTaskCreate(Task_UpdateDisplay, "Display", 256, NULL, 1, &TaskDisplay_Handle);
   /* Start scheduler */
   vTaskStartScheduler();
-
-  /* Temporal buffer for display data */
-  char lcd_buffer[50]; 
 
   /* Infinite loop */
   while (1)
   {
-    /* Main code for master */
-    /* If a new message has arrived that requires updating the display */
-    if (flag_update_display == 1) { 
-      /* Show data */
-      sprintf(lcd_buffer, " DATO: %lu     ", my_rx_frame.payload_data);
-      BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
-      BSP_LCD_DisplayStringAtLine(3, (uint8_t *)lcd_buffer);
-
-      /* Show sequence number */
-      sprintf(lcd_buffer, " SECUENCIA: %u  ", my_rx_frame.seq_number);
-      BSP_LCD_SetTextColor(LCD_COLOR_LIGHTBLUE);
-      BSP_LCD_DisplayStringAtLine(4, (uint8_t *)lcd_buffer);
-
-      /* Check message status */
-      if (last_msg_status == FT_OK) {
-          BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
-          BSP_LCD_DisplayStringAtLine(6, (uint8_t *)" ESTADO: OK       ");
-      } 
-      else if (last_msg_status == FT_ERR_CRC_FAILED) {
-          BSP_LCD_SetTextColor(LCD_COLOR_RED);
-          BSP_LCD_DisplayStringAtLine(6, (uint8_t *)" ERROR: CRC FAIL  ");
-      }
-      else if (last_msg_status == FT_ERR_FRAME_LOST) {
-          BSP_LCD_SetTextColor(LCD_COLOR_ORANGE);
-          BSP_LCD_DisplayStringAtLine(6, (uint8_t *)" ERROR: FRAME LOST");
-      }
-
-      /* Show fault statistics */
-      sprintf(lcd_buffer, " Faults CRC: %lu ", my_can_context.stats_crc_errors);
-      BSP_LCD_SetTextColor(LCD_COLOR_RED);
-      BSP_LCD_DisplayStringAtLine(8, (uint8_t *)lcd_buffer);
-
-      sprintf(lcd_buffer, " Losts packages: %lu   ", my_can_context.stats_frames_lost);
-      BSP_LCD_SetTextColor(LCD_COLOR_ORANGE);
-      BSP_LCD_DisplayStringAtLine(9, (uint8_t *)lcd_buffer);
-
-      /* Update display flag */
-      flag_update_display = 0;
-    }
-
-    /* Fill data with sensor values */
-    can_proto_pack_sensor_data(&my_tx_frame, 2048); 
-
-    /* Send message safely to the bus
-      (If slave using &hcan1, if you are in the Master use &hcan2) */
-    CAN_Safe_Transmit(&hcan2, CAN_ID_MASTER_CMD, &my_tx_frame);
-
-    /* Wait 1 second for the next transmission */
-    HAL_Delay(1000);
+    NULL;
   }
 }
 
@@ -187,8 +137,7 @@ int main(void)
   * @brief System Clock Configuration
   * @retval None
   */
-void SystemClock_Config(void)
-{
+void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
@@ -240,8 +189,7 @@ void SystemClock_Config(void)
   * @param None
   * @retval None
   */
-static void MX_CAN2_Init(void)
-{
+static void MX_CAN2_Init(void) {
   /* Configure CAN2 */
   hcan2.Instance = CAN2;
   hcan2.Init.Prescaler = 9;
@@ -290,8 +238,7 @@ static void MX_CAN2_Init(void)
   * @param None
   * @retval None
   */
-static void MX_CRC_Init(void)
-{
+static void MX_CRC_Init(void) {
   hcrc.Instance = CRC;
   if (HAL_CRC_Init(&hcrc) != HAL_OK)
   {
@@ -304,8 +251,7 @@ static void MX_CRC_Init(void)
   * @param None
   * @retval None
   */
-static void MX_DMA2D_Init(void)
-{
+static void MX_DMA2D_Init(void) {
   hdma2d.Instance = DMA2D;
   hdma2d.Init.Mode = DMA2D_M2M;
   hdma2d.Init.ColorMode = DMA2D_OUTPUT_ARGB8888;
@@ -329,8 +275,7 @@ static void MX_DMA2D_Init(void)
   * @param None
   * @retval None
   */
-static void MX_I2C3_Init(void)
-{
+static void MX_I2C3_Init(void) {
   hi2c3.Instance = I2C3;
   hi2c3.Init.ClockSpeed = 100000;
   hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -365,8 +310,7 @@ static void MX_I2C3_Init(void)
   * @param None
   * @retval None
   */
-static void MX_LTDC_Init(void)
-{
+static void MX_LTDC_Init(void) {
 
   /* USER CODE BEGIN LTDC_Init 0 */
 
@@ -447,8 +391,7 @@ static void MX_LTDC_Init(void)
   * @param None
   * @retval None
   */
-static void MX_SPI5_Init(void)
-{
+static void MX_SPI5_Init(void) {
 
   /* USER CODE BEGIN SPI5_Init 0 */
 
@@ -485,8 +428,7 @@ static void MX_SPI5_Init(void)
   * @param None
   * @retval None
   */
-static void MX_TIM1_Init(void)
-{
+static void MX_TIM1_Init(void) {
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
@@ -520,8 +462,7 @@ static void MX_TIM1_Init(void)
   * @param None
   * @retval None
   */
-static void MX_USART1_UART_Init(void)
-{
+static void MX_USART1_UART_Init(void) {
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -537,8 +478,7 @@ static void MX_USART1_UART_Init(void)
 }
 
 /* FMC initialization function */
-static void MX_FMC_Init(void)
-{
+static void MX_FMC_Init(void) {
   FMC_SDRAM_TimingTypeDef SdramTiming = {0};
 
   /** Perform the SDRAM1 memory initialization sequence
@@ -576,8 +516,7 @@ static void MX_FMC_Init(void)
   * @param None
   * @retval None
   */
-static void MX_GPIO_Init(void)
-{
+static void MX_GPIO_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -654,8 +593,7 @@ static void MX_GPIO_Init(void)
   * @param None
   * @retval None
   */
-static void MX_LCD_Display_Init(void)
-{
+static void MX_LCD_Display_Init(void) {
   /* Initialize SDRAM */
   BSP_SDRAM_Init();
   /* Initialize LCD panel display*/
@@ -666,16 +604,8 @@ static void MX_LCD_Display_Init(void)
   BSP_LCD_SelectLayer(1);
   /* Draw the initial screen */
   BSP_LCD_Clear(LCD_COLOR_BLACK);
-  /* Configure text properties */
-  BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
-  BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
-  BSP_LCD_SetFont(&Font20);
-  /* Display initial strings */
-  BSP_LCD_DisplayStringAtLine(1, (uint8_t *)"  TFM TOLERANCIA    ");
-  BSP_LCD_DisplayStringAtLine(2, (uint8_t *)"     A FALLOS       ");
-  /* Display waiting message */
-  BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
-  BSP_LCD_DisplayStringAtLine(5, (uint8_t *)" ESPERANDO DATOS... ");
+  /* Initialize touch screen */
+  BSP_TS_Init(240, 320);
 }
 
 /**
@@ -684,8 +614,7 @@ static void MX_LCD_Display_Init(void)
  * @param  target_can_id: El ID del mensaje (ej. CAN_ID_MASTER_CMD o CAN_ID_SLAVE_TELEMETRY)
  * @param  frame_to_send: Puntero a la estructura ya rellenada con tus datos
  */
-void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_frame_payload_t *frame_to_send) 
-{
+void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_frame_payload_t *frame_to_send) {
   CAN_TxHeaderTypeDef tx_header;
   uint32_t tx_mailbox;
   uint8_t tx_data[8];
@@ -698,7 +627,7 @@ void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_fram
   tx_header.DLC = 8; // Siempre 8 bytes
   tx_header.TransmitGlobalTime = DISABLE;
   // 2. Treat our frame with the Fault Tolerance library to add CRC and sequence number
-  ft_prepare_tx_frame(frame_to_send, &my_can_context);
+  ft_prepare_tx_frame(frame_to_send, SLAVE1_ID);
   // 3. Add data to the CAN payload
   memcpy(tx_data, frame_to_send, sizeof(can_frame_payload_t));
   // 4. Transmit the message and check for errors
@@ -713,17 +642,16 @@ void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_fram
  * @param  hcan: Puntero al periférico CAN que ha recibido el mensaje (ej. &hcan1 o &hcan2)
  * @retval None
  */
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) 
-{
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
   CAN_RxHeaderTypeDef rx_header;
-  uint8_t rx_data[8];can_frame_payload_t incoming_msg;
+  uint8_t rx_data[8];
+  rtos_can_msg_t incoming_msg;
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
   /* Get the received message from the CAN peripheral */
   if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK) {
-      
-    /* Copy received data to our frame structure */
-    memcpy(&my_rx_frame, rx_data, sizeof(can_frame_payload_t));
+    /* Safe slave id*/
+    incoming_msg.sender_id = rx_header.StdId;
     /* Send the received message to the FreeRTOS queue */
     xQueueSendFromISR(can_rx_queue, &incoming_msg, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
@@ -742,20 +670,41 @@ void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef *hcan) {
  * @param  argument: No se usa, pero es un puntero que podrías usar para pasar datos a la tarea si quisieras
  * @retval None
  */
-void Task_ProcessData(void *argument) 
-{
-    can_frame_payload_t msg_to_process;
+void Task_ProcessData(void *argument) {
+  /* Data to process from Queue */
+  rtos_can_msg_t msg_to_process;
 
-    while(1) {
-        /* Wait for a message to be received on the CAN queue */
-        if (xQueueReceive(can_rx_queue, &msg_to_process, portMAX_DELAY) == pdPASS) {
-            
-            // ¡AQUÍ ENTRAREMOS EN EL FUTURO!
-            // Identificaremos el esclavo, calcularemos CRC, aplicaremos los castigos...
-            
-            // De momento, solo probamos que el OS funciona
-            // last_msg_status = ft_verify_rx_frame(&msg_to_process, &my_can_context);
+  while(1) {
+      /* Wait for a message to be received on the CAN queue */
+      if (xQueueReceive(can_rx_queue, &msg_to_process, portMAX_DELAY) == pdPASS) {
+        /* Process the message with the Fault Tolerance library to check CRC and sequence */
+        last_msg_status = ft_process_message(&msg_to_process.frame, msg_to_process.sender_id);
+          
+        /* Treatment of fault conditions */
+        if (last_msg_status == FT_SYNC_REQUIRED) {
+            //TODO: SYNC PROCEDURE (e.g. request the latest valid data from the other node, or reset sequence number, etc.)
         }
+        else if (last_msg_status == FT_ERR_CRC_FAILED) {
+            //TODO: CRC ERROR TREATMENT (e.g. discard message, request retransmission, etc.)
+        }
+      }
+  }
+}
+
+/**
+ * @brief  Functions to print text on the LCD at specific coordinates (for simplicity, we use a basic function that prints character by character)
+ * @param  x: X coordinate on the LCD
+ * @param  y: Y coordinate on the LCD
+ * @param  text: Text to print
+ * @retval None
+ */
+void print_at_anyfont(uint16_t x, uint16_t y, char* text) {
+    int i = 0;
+    uint16_t font_width = BSP_LCD_GetFont()->Width;
+    
+    while(text[i] != '\0') {
+        BSP_LCD_DisplayChar(x + (i * font_width), y, text[i]);
+        i++;
     }
 }
 
@@ -764,15 +713,150 @@ void Task_ProcessData(void *argument)
  * @param  argument: No se usa, pero es un puntero que podrías usar para pasar datos a la tarea si quisieras
  * @retval None
  */
-void Task_UpdateDisplay(void *argument) 
-{
-    while(1) {
-        /* Wait for the specified delay */
-        vTaskDelay(pdMS_TO_TICKS(200));
+void Task_UpdateDisplay(void *argument) {
+  char txt[40];
+  TS_StateTypeDef TS_State;
 
-        // Aquí pondremos los sprintf y BSP_LCD_DisplayStringAtLine
-        // usando los datos seguros ya validados por el Procesador
+  while(1) {
+    /* Check touch state */
+    BSP_TS_GetState(&TS_State);
+    
+    if (TS_State.TouchDetected) {
+        uint16_t x = TS_State.X;
+        uint16_t y = TS_State.Y;
+
+        if (actual_display == DISPLAY_MAIN) {
+          /* Take action based on touch coordinates */
+          if (x < 120 && y > 160) { actual_display = DISPLAY_NODE_1; update_display = 1; }
+          else if (x > 120 && y > 160) { actual_display = DISPLAY_NODE_2; update_display = 1; }
+          else if (x < 120 && y < 160) { actual_display = DISPLAY_NODE_3; update_display = 1; }
+          else if (x > 120 && y < 160) { actual_display = DISPLAY_CONTROL; update_display = 1; }
+        } 
+        else {
+          /* If submenus check for return button */
+          if (50 > y) { 
+              actual_display = DISPLAY_MAIN; 
+              update_display = 1; 
+          }
+          /* Check for control panel interactions */
+          else if (actual_display == DISPLAY_CONTROL) {
+              if (y > 60 && y < 110) { 
+                  slave_contexts[0].is_muted = !slave_contexts[0].is_muted; 
+                  slave_contexts[0].consecutive_crc_errors = 0;
+              }
+              else if (y > 120 && y < 170) { 
+                  slave_contexts[1].is_muted = !slave_contexts[1].is_muted; 
+                  slave_contexts[1].consecutive_crc_errors = 0;
+              }
+              else if (y > 180 && y < 230) { 
+                  slave_contexts[2].is_muted = !slave_contexts[2].is_muted; 
+                  slave_contexts[2].consecutive_crc_errors = 0;
+              }
+          }
+        }
+        /* To avoid excessive CPU usage */
+        vTaskDelay(pdMS_TO_TICKS(250)); 
     }
+    /* Render of menus */
+    if (update_display) {
+        BSP_LCD_Clear(LCD_COLOR_WHITE);      
+        BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+        if (actual_display == DISPLAY_MAIN) {
+            /* Render main menu */
+            BSP_LCD_SetTextColor(LCD_COLOR_DARKGRAY);
+            BSP_LCD_DrawLine(120, 0, 120, 320);
+            BSP_LCD_DrawLine(0, 160, 240, 160);
+
+            BSP_LCD_SetFont(&Font16);
+            BSP_LCD_SetTextColor(LCD_COLOR_BLUE);
+            print_at_anyfont(15, 60, "SLAVE 1");
+            print_at_anyfont(135, 60, "SLAVE 2");
+            print_at_anyfont(15, 220, "SLAVE 3");
+            BSP_LCD_SetTextColor(LCD_COLOR_RED);
+            print_at_anyfont(135, 220, "PANNEL");
+            print_at_anyfont(135, 240, "CONTROL");
+        }
+        else {
+            /* Render back button */
+            BSP_LCD_SetTextColor(LCD_COLOR_BLUE);
+            BSP_LCD_FillRect(0, 280, 240, 40); 
+            BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+            BSP_LCD_SetBackColor(LCD_COLOR_BLUE);
+            BSP_LCD_SetFont(&Font16);
+            print_at_anyfont(60, 292, "[ < BACK ]");
+            BSP_LCD_SetBackColor(LCD_COLOR_WHITE); 
+            BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+        }
+        update_display = 0; 
+    }
+
+    /* Render dynamic data */
+    BSP_LCD_SetFont(&Font16);
+    
+    /* Display node information */
+    for (int i = 0; i < 3; i++) {
+      if ((actual_display == DISPLAY_NODE_1 && i == 0) ||
+          (actual_display == DISPLAY_NODE_2 && i == 1) ||
+          (actual_display == DISPLAY_NODE_3 && i == 2)) 
+      {
+        BSP_LCD_SetTextColor(LCD_COLOR_BLUE);
+        sprintf(txt, "STATISTICS NODE %d", i+1);
+        print_at_anyfont(10, 20, txt);
+        
+        BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+        BSP_LCD_SetFont(&Font12);
+        sprintf(txt, "Data: %04lu   ", slave_contexts[i].last_valid_data);
+        print_at_anyfont(10, 60, txt);
+        sprintf(txt, "Seq number: %04lu   ", slave_contexts[i].expected_seq_num);
+        print_at_anyfont(10, 80, txt);
+        sprintf(txt, "Faults CRC: %lu    ", slave_contexts[i].stats_crc_errors);
+        print_at_anyfont(10, 110, txt);
+        sprintf(txt, "Lost Frames: %lu  ", slave_contexts[i].stats_frames_lost);
+        print_at_anyfont(10, 130, txt);
+
+        /* Actual state */
+        if (slave_contexts[i].is_muted) {
+            BSP_LCD_SetTextColor(LCD_COLOR_RED);
+            print_at_anyfont(10, 160, "ESTADO: MUTEADO (RED)");
+        } else if (slave_contexts[i].consecutive_crc_errors > 0) {
+            BSP_LCD_SetTextColor(LCD_COLOR_ORANGE);
+            print_at_anyfont(10, 160, "ESTADO: ALERTA CRC!  ");
+        } else {
+            BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
+            print_at_anyfont(10, 160, "ESTADO: ACTIVO (OK)  ");
+        }
+      }
+    }
+
+    /* Render control panel */
+    if (actual_display == DISPLAY_CONTROL) {
+      BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+      print_at_anyfont(10, 20, "GESTION DE NODOS");
+      
+      BSP_LCD_SetFont(&Font12);
+      for(int i = 0; i < 3; i++) {
+        uint16_t y_pos = 80 + (i * 60);
+        
+        BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+        sprintf(txt, "NODO %d:", i+1);
+        print_at_anyfont(10, y_pos, txt);
+        
+        /* Status indicator */
+        if (slave_contexts[i].is_muted) {
+          BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+          BSP_LCD_FillCircle(180, y_pos + 5, 15);
+          print_at_anyfont(80, y_pos, "[ OFF ] ");
+        } else {
+          BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
+          BSP_LCD_FillCircle(180, y_pos + 5, 15);
+          BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+          print_at_anyfont(80, y_pos, "[ ACTIVE ] ");
+        }
+      }
+    }
+    /* Refresh control (5 Hz)*/
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
 }
 
 /**
@@ -783,8 +867,7 @@ void Task_UpdateDisplay(void *argument)
   * @param  htim : TIM handle
   * @retval None
   */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   /* USER CODE BEGIN Callback 0 */
 
   /* USER CODE END Callback 0 */
@@ -801,8 +884,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   * @brief  This function is executed in case of error occurrence.
   * @retval None
   */
-void Error_Handler(void)
-{
+void Error_Handler(void){
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();

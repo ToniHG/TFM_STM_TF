@@ -51,6 +51,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ../common/inc
     ${ST_FW}/Drivers/BSP/STM32F429I-Discovery
     ${ST_FW}/Drivers/BSP/Components/ili9341
+    ${ST_FW}/Drivers/BSP/Components/stmpe811
     ${ST_FW}/Drivers/BSP/Components/Common
     ${ST_FW}/Utilities/Fonts
 )
@@ -65,6 +66,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${ST_FW}/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_lcd.c
     ${ST_FW}/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_sdram.c
     ${ST_FW}/Drivers/BSP/Components/ili9341/ili9341.c
+    ${ST_FW}/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_ts.c
+    ${ST_FW}/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_io.c
+    ${ST_FW}/Drivers/BSP/Components/stmpe811/stmpe811.c
 )
 
 # Add project symbols (macros)

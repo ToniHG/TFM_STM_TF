@@ -4,41 +4,55 @@
 #include "can_protocol.h"
 #include <stdint.h>
 
+/* Defines configuration */
+#define SLAVE1_ID 0x101
+#define SLAVE2_ID 0x102
+#define SLAVE3_ID 0x103
+#define MAX_SEQ_NUM 255
+#define MAX_FRAME_LOSS 5
+#define MAX_CRC_ERRORS 3
+#define SENSOR_MAX_VALID 5000
 /* ========================================================================= */
-/* CÓDIGOS DE ESTADO DEL ALGORITMO                                           */
+/* CODES FOR DATA PROCESSING                                                 */
 /* ========================================================================= */
+
 typedef enum {
-    FT_OK = 0,                 // Trama correcta y en orden
-    FT_ERR_CRC_FAILED = -1,    // Fallo de integridad: los datos se han corrompido
-    FT_ERR_FRAME_LOST = -2,    // Salto de secuencia: se han perdido tramas en el bus
-    FT_ERR_DUPLICATE  = -3     // Trama duplicada o desordenada (antigua)
+    FT_OK               = 0,
+    FT_ERR_CRC_FAILED   = -1,
+    FT_ERR_FRAME_LOST   = -2,
+    FT_ERR_MUTED        = -3,
+    FT_ERR_CREDIBILITY  = -4,
+    FT_SYNC_REQUIRED    = -5
 } ft_status_t;
 
 /* ========================================================================= */
-/* CONTEXTO DE TOLERANCIA A FALLOS                                           */
-/* Guarda el estado actual de una conexión (Ej: del Máster hacia el Esclavo) */
+/* CONTEXT FOR FAULT TOLERANCE                                               */
+/* Save fault tolerance information for each slave                           */
 /* ========================================================================= */
 typedef struct {
-    uint8_t tx_seq_num;      // Siguiente número de secuencia que VAMOS a enviar
-    uint8_t rx_expected_seq; // Siguiente número de secuencia que ESPERAMOS recibir
-
-    // Contadores estadísticos (¡Ideales para mostrarlos en el display del Máster!)
-    uint32_t stats_frames_lost;
+    uint32_t expected_seq_num;
     uint32_t stats_crc_errors;
+    uint32_t stats_frames_lost;;
     uint32_t stats_frames_ok;
+    uint8_t  consecutive_crc_errors; 
+    uint8_t  is_muted;
+    uint32_t last_valid_data;
 } ft_context_t;
 
+/* Context with fault tolerance information for each slave */
+extern ft_context_t slave_contexts[3]; // El array para los 3 esclavos
+
 /* ========================================================================= */
-/* PROTOTIPOS DE FUNCIONES                                                   */
+/* FUNCTIONS PROTOTYPES                                                      */
 /* ========================================================================= */
 
-// Inicializa a cero los contadores de un contexto
-void ft_init_context(ft_context_t *ctx);
+/* Initialize fault tolerance context */
+void ft_init_context();
 
-// Prepara una trama para enviarla (Añade Secuencia y calcula CRC)
-ft_status_t ft_prepare_tx_frame(can_frame_payload_t *frame, ft_context_t *ctx);
+/* Prepare a frame for transmission (Adds sequence number and calculates CRC) */
+ft_status_t ft_prepare_tx_frame(can_frame_payload_t *frame, uint32_t can_id);
 
-// Verifica una trama recién recibida (Comprueba CRC y Secuencia)
-ft_status_t ft_verify_rx_frame(const can_frame_payload_t *frame, ft_context_t *ctx);
+/* Process a received message (Checks CRC and sequence) */
+ft_status_t ft_process_message(can_frame_payload_t *frame, uint32_t can_id);
 
 #endif /* FAULT_TOLERANCE_H_ */

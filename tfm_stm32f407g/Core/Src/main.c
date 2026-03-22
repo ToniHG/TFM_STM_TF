@@ -18,44 +18,28 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "usb_host.h"
 #include "can_protocol.h"
 #include "fault_tolerance.h"
+#include "crc16.h"
 #include <string.h>
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
 
 /* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-
-/* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-CAN_HandleTypeDef hcan1;
-
-I2C_HandleTypeDef hi2c1;
-
-I2S_HandleTypeDef hi2s3;
-
-SPI_HandleTypeDef hspi1;
-
-/* USER CODE BEGIN PV */
-ft_context_t my_can_context; // Nuestra memoria de tolerancia a fallos
-can_frame_payload_t my_rx_frame; // Donde guardaremos lo que llega
-can_frame_payload_t my_tx_frame; // Donde preparamos lo que sale
-
-/* USER CODE END PV */
+CAN_HandleTypeDef hcan1;          // CAN1 handle for communication
+I2C_HandleTypeDef hi2c1;          // I2C1 handle for sensor communication
+I2S_HandleTypeDef hi2s3;          // I2S3 handle for audio (not used in this example but initialized)
+SPI_HandleTypeDef hspi1;          // SPI1 handle for other peripherals (not used in this example but initialized)
+QueueHandle_t sensor_mailbox;     // Mailbox (queue) for sending sensor data from Task_ReadSensors to Task_SendCAN
+TaskHandle_t TaskSensors_Handle;  // Handle for the sensor reading task
+TaskHandle_t TaskCAN_Handle;      // Handle for the CAN sending task
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -64,12 +48,8 @@ static void MX_CAN1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2S3_Init(void);
 static void MX_SPI1_Init(void);
-void MX_USB_HOST_Process(void);
-void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_frame_payload_t *frame_to_send);
-
-/* USER CODE BEGIN PFP */
-
-/* USER CODE END PFP */
+void Task_ReadSensors(void *argument);
+void Task_SendCAN(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 
@@ -77,8 +57,7 @@ void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_fram
   * @brief  The application entry point.
   * @retval int
   */
-int main(void)
-{
+int main(void) {
   /* MCU Configuration--------------------------------------------------------*/
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
@@ -90,46 +69,18 @@ int main(void)
   MX_I2C1_Init();
   MX_I2S3_Init();
   MX_SPI1_Init();
-  MX_USB_HOST_Init();
-  /* Initialize memory for Fault Tolerance can context */
-  ft_init_context(&my_can_context);
-  /* Configure  CAN filter to listen to all messages */
-  CAN_FilterTypeDef canfilterconfig;
-  canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
-  canfilterconfig.FilterBank = 0;  
-  canfilterconfig.FilterFIFOAssignment = CAN_RX_FIFO0;
-  canfilterconfig.FilterIdHigh = 0x0000;
-  canfilterconfig.FilterIdLow = 0x0000;
-  canfilterconfig.FilterMaskIdHigh = 0x0000;
-  canfilterconfig.FilterMaskIdLow = 0x0000;
-  canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
-  canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
-  canfilterconfig.SlaveStartFilterBank = 14;
-  /* Initialize CAN filter and interrupts for reception */
-  if (HAL_CAN_ConfigFilter(&hcan1, &canfilterconfig) != HAL_OK) {
-      Error_Handler();
-  }
-  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
-      Error_Handler();
-  }
-  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
-      Error_Handler();
-  }
+  /* Initialize sensor queue */
+  sensor_mailbox = xQueueCreate(1, sizeof(uint32_t));
+  /* Create tasks */
+  xTaskCreate(Task_ReadSensors, "Read_Sensors", 128, NULL, 2, &TaskSensors_Handle);
+  xTaskCreate(Task_SendCAN, "Send_CAN", 256, NULL, 1, &TaskCAN_Handle);
+  /* Start scheduler */
+  vTaskStartScheduler();
 
   /* Infinite loop */
   while (1)
   {
-    MX_USB_HOST_Process();
-
-    /* 1. Fill data with sensor values */
-    can_proto_pack_sensor_data(&my_tx_frame, 2048); 
-
-    /* 2. Send message safely to the bus
-      (If slave using &hcan1, if you are in the Master use &hcan2) */
-    CAN_Safe_Transmit(&hcan1, CAN_ID_SLAVE_TELEMETRY, &my_tx_frame);
-
-    /* 3. Wait 1 second for the next transmission */
-    HAL_Delay(1000);
+    NULL; // Just to avoid compiler warnings about empty while loop
   }
 }
 
@@ -137,8 +88,7 @@ int main(void)
   * @brief System Clock Configuration
   * @retval None
   */
-void SystemClock_Config(void)
-{
+void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
@@ -183,8 +133,8 @@ void SystemClock_Config(void)
   * @param None
   * @retval None
   */
-static void MX_CAN1_Init(void)
-{
+static void MX_CAN1_Init(void) {
+  /* Initialize the CAN1 peripheral */
   hcan1.Instance = CAN1;
   hcan1.Init.Prescaler = 6;
   hcan1.Init.Mode = CAN_MODE_NORMAL;
@@ -197,9 +147,28 @@ static void MX_CAN1_Init(void)
   hcan1.Init.AutoRetransmission = DISABLE;
   hcan1.Init.ReceiveFifoLocked = DISABLE;
   hcan1.Init.TransmitFifoPriority = DISABLE;
-  if (HAL_CAN_Init(&hcan1) != HAL_OK)
-  {
-    Error_Handler();
+  /* Configure the CAN Filter */
+  CAN_FilterTypeDef can_filter_config;
+  can_filter_config.FilterBank = 0;
+  can_filter_config.FilterMode = CAN_FILTERMODE_IDMASK;
+  can_filter_config.FilterScale = CAN_FILTERSCALE_32BIT;
+  can_filter_config.FilterIdHigh = 0x0000;
+  can_filter_config.FilterIdLow = 0x0000;
+  can_filter_config.FilterMaskIdHigh = 0x0000;
+  can_filter_config.FilterMaskIdLow = 0x0000;
+  can_filter_config.FilterFIFOAssignment = CAN_RX_FIFO0;
+  can_filter_config.FilterActivation = ENABLE;
+  can_filter_config.SlaveStartFilterBank = 14;
+  if (HAL_CAN_ConfigFilter(&hcan1, &can_filter_config) != HAL_OK) {
+      Error_Handler();
+  }
+  /* Start the CAN peripheral */
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+      Error_Handler();
+  }
+  /* Activate CAN RX interrupt */
+  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
+      Error_Handler();
   }
 }
 
@@ -208,8 +177,7 @@ static void MX_CAN1_Init(void)
   * @param None
   * @retval None
   */
-static void MX_I2C1_Init(void)
-{
+static void MX_I2C1_Init(void) {
   hi2c1.Instance = I2C1;
   hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -230,8 +198,7 @@ static void MX_I2C1_Init(void)
   * @param None
   * @retval None
   */
-static void MX_I2S3_Init(void)
-{
+static void MX_I2S3_Init(void) {
   hi2s3.Instance = SPI3;
   hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
   hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
@@ -252,8 +219,7 @@ static void MX_I2S3_Init(void)
   * @param None
   * @retval None
   */
-static void MX_SPI1_Init(void)
-{
+static void MX_SPI1_Init(void) {
   /* SPI1 parameter configuration*/
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_MASTER;
@@ -278,8 +244,7 @@ static void MX_SPI1_Init(void)
   * @param None
   * @retval None
   */
-static void MX_GPIO_Init(void)
-{
+static void MX_GPIO_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
@@ -351,89 +316,72 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
 }
 
-/* USER CODE BEGIN 4 */
-/* USER CODE BEGIN 4 */
+/**
+  * @brief  Task to read sensors data.
+  * @param  argument: Not used
+  * @retval None
+  */
+void Task_ReadSensors(void *argument) {
+    uint32_t raw_sensor_value = 0;
+
+    while(1) {
+        // Simulamos que el sensor sube poco a poco
+        raw_sensor_value++;
+
+        // Metemos el dato en el buzón. 
+        // xQueueOverwrite machaca el dato viejo si el CAN aún no lo ha leído, 
+        // garantizando que siempre se envía lo más fresco.
+        xQueueOverwrite(sensor_mailbox, &raw_sensor_value);
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
 
 /**
- * @brief  Función universal para enviar tramas seguras al bus CAN
- * @param  hcan: Puntero al periférico CAN (&hcan1 en Esclavo, &hcan2 en Master)
- * @param  target_can_id: El ID del mensaje (ej. CAN_ID_MASTER_CMD o CAN_ID_SLAVE_TELEMETRY)
- * @param  frame_to_send: Puntero a la estructura ya rellenada con tus datos
- */
-void CAN_Safe_Transmit(CAN_HandleTypeDef *hcan, uint32_t target_can_id, can_frame_payload_t *frame_to_send) {
+  * @brief  Task to send CAN messages with sensor data every time defined.
+  * @param  argument: Not used
+  * @retval None
+  */
+void Task_SendCAN(void *argument) {
     CAN_TxHeaderTypeDef tx_header;
     uint32_t tx_mailbox;
+    can_frame_payload_t my_tx_frame;
     uint8_t tx_data[8];
+    uint8_t seq_counter = 0;
+    uint32_t current_sensor_data = 0;
 
-    // 1. Configurar la cabecera hardware
-    tx_header.StdId = target_can_id; 
+    /* Configure the header for this slave */
+    tx_header.StdId = SLAVE1_ID; /* This value should be changed for each slave (SLAVE1_ID, SLAVE2_ID, SLAVE3_ID)*/
     tx_header.ExtId = 0;
     tx_header.IDE = CAN_ID_STD;
     tx_header.RTR = CAN_RTR_DATA;
-    tx_header.DLC = 8; // Siempre 8 bytes
-    tx_header.TransmitGlobalTime = DISABLE;
+    tx_header.DLC = 8;
 
-    // 2. Aplicar Tolerancia a Fallos (Secuencia + CRC)
-    ft_prepare_tx_frame(frame_to_send, &my_can_context);
-
-    // 3. Pasar nuestra estructura al buffer crudo del hardware
-    memcpy(tx_data, frame_to_send, sizeof(can_frame_payload_t));
-
-    // 4. Inyectar al bus
-    if (HAL_CAN_AddTxMessage(hcan, &tx_header, tx_data, &tx_mailbox) != HAL_OK) {
-        // Podrías encender un LED de error de hardware aquí
-        Error_Handler();
-    }
-}
-
-/**
- * @brief  Callback universal de Recepción (Salta automáticamente al llegar un mensaje)
- */
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
-    CAN_RxHeaderTypeDef rx_header;
-    uint8_t rx_data[8];
-
-    // Sacamos el mensaje del buzón del hardware
-    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK) {
-        
-        // Lo pasamos a nuestra estructura
-        memcpy(&my_rx_frame, rx_data, sizeof(can_frame_payload_t));
-
-        // ¡VERIFICACIÓN DE SEGURIDAD!
-        ft_status_t status = ft_verify_rx_frame(&my_rx_frame, &my_can_context);
-
-        if (status == FT_OK) {
-            // ✅ Trama perfecta. Aquí metes tu lógica (ej. leer el sensor o procesar comando)
-            
-            // Si eres el Máster y recibes telemetría del esclavo:
-            if (rx_header.StdId == CAN_ID_SLAVE_TELEMETRY) {
-                // Actualizar la pantalla LCD con: my_rx_frame.payload_data
-            }
-
-        } else if (status == FT_ERR_CRC_FAILED) {
-            // ❌ Error grave: Datos corruptos por ruido eléctrico
-            my_can_context.stats_crc_errors++;
-            
-        } else if (status == FT_ERR_FRAME_LOST) {
-            // ⚠️ Advertencia: Nos hemos perdido mensajes por el camino
-            my_can_context.stats_frames_lost++;
+    while(1) {
+        /* Receive the latest sensor data */
+        xQueueReceive(sensor_mailbox, &current_sensor_data, 0);
+        /* Arm the message */
+        my_tx_frame.msg_type = MSG_TYPE_SENSOR_DATA;
+        my_tx_frame.seq_number = seq_counter++;
+        my_tx_frame.payload_data = current_sensor_data;
+        /* Calculate the CRC */
+        my_tx_frame.crc16 = calculate_crc16((uint8_t*)&my_tx_frame, 6);
+        /* Fault Injection */
+        if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET) {
+            /* If the fault injection button is pressed, invert the CRC bits */
+            my_tx_frame.crc16 ^= 0xFFFF; 
         }
+        memcpy(tx_data, &my_tx_frame, 8);
+        HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
+        vTaskDelay(pdMS_TO_TICKS(110));
     }
-}
-
-/**
- * @brief  Callback de interrupción: Confirma que el envío terminó con éxito
- */
-void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef *hcan) {
-    // Aquí puedes poner un toggle de un LED verde para saber que el cableado está bien
 }
 
 /**
   * @brief  This function is executed in case of error occurrence.
   * @retval None
   */
-void Error_Handler(void)
-{
+void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
