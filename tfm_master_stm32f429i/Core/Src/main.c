@@ -55,9 +55,6 @@ SPI_HandleTypeDef hspi5;                      // Handle for SPI5 (used for the S
 TIM_HandleTypeDef htim1;                      // Handle for TIM1 (used for timing, if needed)
 UART_HandleTypeDef huart1;                    // Handle for UART (used for debugging, e.g. with printf)
 SDRAM_HandleTypeDef hsdram1;                  // Handle for SDRAM (used by the LCD)
-can_frame_payload_t my_rx_frame;              // To store the last received frame for display purposes 
-can_frame_payload_t my_tx_frame;              // To prepare the frame we want to send (e.g. with sensor data) 
-volatile uint8_t flag_update_display = 0;     // Flag to indicate that the display needs to be updated with new data
 volatile ft_status_t last_msg_status = FT_OK; // Status of the last processed message (for display purposes)
 QueueHandle_t can_rx_queue;                   // FreeRTOS queue to receive CAN messages from the ISR
 TaskHandle_t TaskProcess_Handle;              // Handle for the task that processes CAN messages
