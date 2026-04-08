@@ -8,6 +8,7 @@ ft_context_t slave_contexts[3];
 /* Initialize fault tolerance context */
 void ft_init_context() {
     for(int i = 0; i < 3; i++) {
+        slave_contexts[i].slave_id = SLAVE1_ID + i; // Assign CAN IDs to the contexts
         slave_contexts[i].expected_seq_num = 0;
         slave_contexts[i].stats_crc_errors = 0;
         slave_contexts[i].stats_frames_lost = 0;
@@ -45,6 +46,7 @@ ft_status_t ft_prepare_tx_frame(can_frame_payload_t *frame, uint32_t can_id) {
 }
 
 ft_status_t ft_process_message(can_frame_payload_t *frame, uint32_t can_id) {
+
     int idx = get_slave_index(can_id);
     if (idx < 0) return FT_ERR_FRAME_LOST;      // If the CAN ID is not recognized, we consider it as a lost frame (or you could define another error code)
 
@@ -81,19 +83,39 @@ ft_status_t ft_process_message(can_frame_payload_t *frame, uint32_t can_id) {
     /* Check sequence number */
     if (frame->seq_number != ctx->expected_seq_num) {
         ctx->stats_frames_lost++;
-        /* Update expected sequence number */
-        ctx->expected_seq_num = frame->seq_number + 1;
+        ctx->consecutive_seq_errors++;
         
+        /* If we have too many consecutive sequence errors, we might want to consider the node as failed and require resynchronization */
+        if (ctx->consecutive_seq_errors >= MAX_FRAME_LOSS_CONSC) {
+            ctx->sync_attempts++;
+        
+            if (ctx->sync_attempts > 1) {
+                ctx->is_muted = 1;          // Mute the slave after multiple failed sync attempts
+                return FT_ERR_FRAME_LOST;
+            }
+            else {
+                ctx->stats_frames_lost = 0; // Reset counter after reaching the threshold
+                ctx->expected_seq_num = 0;  // Reset expected sequence number
+                ctx->consecutive_seq_errors = 0;
+                return FT_SYNC_REQUIRED;
+            }
+        }
+            
         /* If we lost too many frames, we might want to consider the node as failed and require resynchronization */
         if (ctx->stats_frames_lost >= MAX_FRAME_LOSS) {
             ctx->stats_frames_lost = 0; // Reset counter after reaching the threshold
             ctx->expected_seq_num = 0;  // Reset expected sequence number
+            ctx->consecutive_seq_errors = 0;
+            ctx->sync_attempts++;
             return FT_SYNC_REQUIRED; 
         }
-        return FT_SYNC_REQUIRED; 
+    }
+    else {
+        ctx->consecutive_seq_errors = 0;
+        ctx->stats_frames_ok++;
     }
     /* No errors, update the expected sequence number and save the valid data */
-    ctx->expected_seq_num++;
+    ctx->expected_seq_num = (frame->seq_number + 1); 
     ctx->last_valid_data = frame->payload_data;
 
     return FT_OK;

@@ -5,11 +5,9 @@
 #include <stdint.h>
 
 /* Defines configuration */
-#define SLAVE1_ID 0x101
-#define SLAVE2_ID 0x102
-#define SLAVE3_ID 0x103
 #define MAX_SEQ_NUM 255
 #define MAX_FRAME_LOSS 5
+#define MAX_FRAME_LOSS_CONSC 3
 #define MAX_CRC_ERRORS 3
 #define SENSOR_MAX_VALID 5000
 /* ========================================================================= */
@@ -30,13 +28,16 @@ typedef enum {
 /* Save fault tolerance information for each slave                           */
 /* ========================================================================= */
 typedef struct {
+    uint32_t slave_id;
+    uint32_t last_valid_data;
     uint32_t expected_seq_num;
     uint32_t stats_crc_errors;
-    uint32_t stats_frames_lost;;
+    uint32_t stats_frames_lost;
     uint32_t stats_frames_ok;
     uint8_t  consecutive_crc_errors; 
+    uint8_t  consecutive_seq_errors;
+    uint8_t  sync_attempts;
     uint8_t  is_muted;
-    uint32_t last_valid_data;
 } ft_context_t;
 
 /* Context with fault tolerance information for each slave */
