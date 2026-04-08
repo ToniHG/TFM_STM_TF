@@ -21,6 +21,8 @@
 #include "can_protocol.h"
 #include "fault_tolerance.h"
 #include "crc16.h"
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include "FreeRTOS.h"
 #include "task.h"
@@ -40,6 +42,10 @@ SPI_HandleTypeDef hspi1;          // SPI1 handle for other peripherals (not used
 QueueHandle_t sensor_mailbox;     // Mailbox (queue) for sending sensor data from Task_ReadSensors to Task_SendCAN
 TaskHandle_t TaskSensors_Handle;  // Handle for the sensor reading task
 TaskHandle_t TaskCAN_Handle;      // Handle for the CAN sending task
+TaskHandle_t TaskProcess_Handle;  // Handle for the data processing task
+volatile uint8_t seq_counter = 0; // Sequence counter for messages, used in fault tolerance algorithm 1
+QueueHandle_t can_rx_queue;       // FreeRTOS queue to receive CAN messages from the ISR
+volatile uint32_t slave_id = SLAVE1_ID; // ID of this slave, should be set according to the hardware configuration (SLAVE1_ID, SLAVE2_ID, SLAVE3_ID)
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -50,6 +56,7 @@ static void MX_I2S3_Init(void);
 static void MX_SPI1_Init(void);
 void Task_ReadSensors(void *argument);
 void Task_SendCAN(void *argument);
+void Task_ProcessData(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 
@@ -71,9 +78,12 @@ int main(void) {
   MX_SPI1_Init();
   /* Initialize sensor queue */
   sensor_mailbox = xQueueCreate(1, sizeof(uint32_t));
+  /* Create the queue for CAN messages */
+  can_rx_queue = xQueueCreate(10, sizeof(rtos_can_msg_t));
   /* Create tasks */
   xTaskCreate(Task_ReadSensors, "Read_Sensors", 128, NULL, 2, &TaskSensors_Handle);
   xTaskCreate(Task_SendCAN, "Send_CAN", 256, NULL, 1, &TaskCAN_Handle);
+  xTaskCreate(Task_ProcessData, "Process_Data", 256, NULL, 2, &TaskProcess_Handle);
   /* Start scheduler */
   vTaskStartScheduler();
 
@@ -317,64 +327,123 @@ static void MX_GPIO_Init(void) {
 }
 
 /**
-  * @brief  Task to read sensors data.
+ * @brief  Callback universal de Recepción (Salta automáticamente al llegar un mensaje)
+ * @param  hcan: Puntero al periférico CAN que ha recibido el mensaje (ej. &hcan1 o &hcan2)
+ * @retval None
+ */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+
+  CAN_RxHeaderTypeDef rx_header;
+  uint8_t rx_data[8];
+  rtos_can_msg_t incoming_msg;
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+  /* Get the received message from the CAN peripheral */
+  if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK) {
+    /* Safe slave id*/
+    incoming_msg.sender_id = rx_header.StdId;
+    if (incoming_msg.sender_id == MASTER_ID) {
+      memcpy(&incoming_msg.frame, rx_data, sizeof(can_frame_payload_t));
+      /* Send the received message to the FreeRTOS queue */
+      xQueueSendFromISR(can_rx_queue, &incoming_msg, &xHigherPriorityTaskWoken);
+      portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+    
+  }
+}
+
+/**
+ * @brief  Callback de interrupción: Confirma que el envío terminó con éxito
+ */
+void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef *hcan) {
+    // Aquí puedes poner un toggle de un LED verde para saber que el cableado está bien
+}
+
+/**
+  * @brief  Task of FreeRTOS to read sensors data.
   * @param  argument: Not used
   * @retval None
   */
 void Task_ReadSensors(void *argument) {
-    uint32_t raw_sensor_value = 0;
 
-    while(1) {
-        // Simulamos que el sensor sube poco a poco
-        raw_sensor_value++;
+  uint32_t raw_sensor_value = 0;
 
-        // Metemos el dato en el buzón. 
-        // xQueueOverwrite machaca el dato viejo si el CAN aún no lo ha leído, 
-        // garantizando que siempre se envía lo más fresco.
-        xQueueOverwrite(sensor_mailbox, &raw_sensor_value);
+  while(1) {
+    // Simulamos que el sensor sube poco a poco
+    raw_sensor_value++;
 
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
+    // Metemos el dato en el buzón. 
+    // xQueueOverwrite machaca el dato viejo si el CAN aún no lo ha leído, 
+    // garantizando que siempre se envía lo más fresco.
+    xQueueOverwrite(sensor_mailbox, &raw_sensor_value);
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
 }
 
 /**
-  * @brief  Task to send CAN messages with sensor data every time defined.
+  * @brief  Task of FreeRTOS to send CAN messages with sensor data every time defined.
   * @param  argument: Not used
   * @retval None
   */
 void Task_SendCAN(void *argument) {
-    CAN_TxHeaderTypeDef tx_header;
-    uint32_t tx_mailbox;
-    can_frame_payload_t my_tx_frame;
-    uint8_t tx_data[8];
-    uint8_t seq_counter = 0;
-    uint32_t current_sensor_data = 0;
 
-    /* Configure the header for this slave */
-    tx_header.StdId = SLAVE1_ID; /* This value should be changed for each slave (SLAVE1_ID, SLAVE2_ID, SLAVE3_ID)*/
-    tx_header.ExtId = 0;
-    tx_header.IDE = CAN_ID_STD;
-    tx_header.RTR = CAN_RTR_DATA;
-    tx_header.DLC = 8;
+  CAN_TxHeaderTypeDef tx_header;
+  uint32_t tx_mailbox;
+  can_frame_payload_t my_tx_frame;
+  uint8_t tx_data[8];
+  uint32_t current_sensor_data = 0;
 
-    while(1) {
-        /* Receive the latest sensor data */
-        xQueueReceive(sensor_mailbox, &current_sensor_data, 0);
-        /* Arm the message */
-        my_tx_frame.msg_type = MSG_TYPE_SENSOR_DATA;
-        my_tx_frame.seq_number = seq_counter++;
-        my_tx_frame.payload_data = current_sensor_data;
-        /* Calculate the CRC */
-        my_tx_frame.crc16 = calculate_crc16((uint8_t*)&my_tx_frame, 6);
-        /* Fault Injection */
-        if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET) {
-            /* If the fault injection button is pressed, invert the CRC bits */
-            my_tx_frame.crc16 ^= 0xFFFF; 
-        }
-        memcpy(tx_data, &my_tx_frame, 8);
-        HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
-        vTaskDelay(pdMS_TO_TICKS(110));
+  /* Configure the header for this slave */
+  tx_header.StdId = slave_id; /* This value should be changed for each slave (SLAVE1_ID, SLAVE2_ID, SLAVE3_ID)*/
+  tx_header.ExtId = 0;
+  tx_header.IDE = CAN_ID_STD;
+  tx_header.RTR = CAN_RTR_DATA;
+  tx_header.DLC = 8;
+
+  while(1) {
+    /* Receive the latest sensor data */
+    xQueueReceive(sensor_mailbox, &current_sensor_data, 0);
+    /* Arm the message */
+    my_tx_frame.msg_type = MSG_TYPE_SENSOR_DATA;
+    my_tx_frame.seq_number = seq_counter;
+    my_tx_frame.payload_data = current_sensor_data;
+    /* Calculate the CRC */
+    my_tx_frame.crc16 = calculate_crc16((uint8_t*)&my_tx_frame, 6);
+    /* Fault Injection */
+    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET) {
+        /* If the fault injection button is pressed, invert the CRC bits */
+        my_tx_frame.crc16 ^= 0xFFFF; 
     }
+    memcpy(tx_data, &my_tx_frame, sizeof(can_frame_payload_t));
+    HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
+    seq_counter++;
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+/**
+ * @brief  Task of FreeRTOS to process received CAN messages and apply Fault Tolerance treatment
+ * @param  argument: Not used, but it's a pointer that you could use to pass data to the task if you wanted
+ * @retval None
+ */
+void Task_ProcessData(void *argument) {
+  /* Data to process from Queue */
+  rtos_can_msg_t msg_to_process;
+
+  while(1) {
+    if (xQueueReceive(can_rx_queue, &msg_to_process, 0) == pdPASS) {
+      /* Process the message with the Fault Tolerance library to check CRC and sequence */
+      if (msg_to_process.frame.msg_type == MSG_TYPE_SYNC_REQUIRED &&
+          msg_to_process.frame.payload_data == slave_id &&
+          msg_to_process.frame.crc16 == calculate_crc16((uint8_t*)&msg_to_process.frame, sizeof(can_frame_payload_t) - sizeof(uint16_t))) {
+          /* If we receive a SYNC_REQUIRED message, we can reset our sequence counter to resync with the master */
+          seq_counter = 1; // Reset to 1 because the slave will send the next message with seq=0 after sync
+      }
+      // TODO: Possible improvement more complex processing of the message, for example storing the last N messages and doing majority voting, etc.
+    }
+    vTaskDelay(pdMS_TO_TICKS(25));
+  }
 }
 
 /**
