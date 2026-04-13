@@ -27,6 +27,7 @@
 #include "stm32f429i_discovery_sdram.h"
 #include "stm32f429i_discovery_ts.h"
 #include "FreeRTOS.h"
+#include "stm32f4xx_hal_can.h"
 #include "task.h"
 #include "queue.h"
 
@@ -47,6 +48,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan2;                      // Handle for CAN2 (used as Master in this example)
+CAN_HandleTypeDef hcan1;
 CRC_HandleTypeDef hcrc;                       // Handle for CRC (used for CRC16 calculation in fault tolerance)
 DMA2D_HandleTypeDef hdma2d;                   // Handle for DMA2D (used for efficient LCD updates)
 I2C_HandleTypeDef hi2c3;                      // Handle for I2C3 (used for touch screen, if needed)
@@ -102,12 +104,12 @@ int main(void) {
   SystemClock_Config();
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_CAN2_Init();
   MX_CRC_Init();
   MX_I2C3_Init();
   MX_TIM1_Init();
   MX_USART1_UART_Init();
   MX_LCD_Display_Init();
+  MX_CAN2_Init();
   /* Initialize memory for Fault Tolerance can context */
   ft_init_context();
   /* Create the queue for CAN messages */
@@ -142,11 +144,12 @@ void SystemClock_Config(void) {
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 8;
   RCC_OscInitStruct.PLL.PLLN = 180;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 3;
@@ -196,7 +199,7 @@ static void MX_CAN2_Init(void) {
   hcan2.Init.AutoRetransmission = DISABLE;
   hcan2.Init.ReceiveFifoLocked = DISABLE;
   hcan2.Init.TransmitFifoPriority = DISABLE;
-  /* Configure  CAN filter to listen to all messages */
+  /* Configure  CAN filter to listen to all messages 
   CAN_FilterTypeDef canfilterconfig;
   canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
   canfilterconfig.FilterBank = 14;
@@ -209,12 +212,12 @@ static void MX_CAN2_Init(void) {
   canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
   canfilterconfig.SlaveStartFilterBank = 14;
 
-  /* Initialize CAN */
+  /* Initialize CAN 
   if (HAL_CAN_Init(&hcan2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* Initialize CAN filter and interrupts for reception */
+  /* Initialize CAN filter and interrupts for reception 
   if (HAL_CAN_ConfigFilter(&hcan2, &canfilterconfig) != HAL_OK) {
       Error_Handler();
   }
@@ -223,7 +226,51 @@ static void MX_CAN2_Init(void) {
   }
   if (HAL_CAN_ActivateNotification(&hcan2, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
       Error_Handler();
-  }
+  }*/
+
+  __HAL_RCC_CAN1_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin = GPIO_PIN_11 | GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF9_CAN1;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  hcan1.Instance = CAN1;
+  hcan1.Init.Prescaler = 24;      // 45MHz / 36 / 12TQ = 125 kbps (Igual que el esclavo)
+  hcan1.Init.Mode = CAN_MODE_NORMAL; 
+  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_12TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
+  hcan1.Init.TimeTriggeredMode = DISABLE;
+  hcan1.Init.AutoBusOff = DISABLE;
+  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoRetransmission = ENABLE; 
+  hcan1.Init.ReceiveFifoLocked = DISABLE;
+  hcan1.Init.TransmitFifoPriority = DISABLE;
+  HAL_CAN_Init(&hcan1);
+
+  CAN_FilterTypeDef canfilterconfig1;
+  canfilterconfig1.FilterActivation = CAN_FILTER_ENABLE;
+  canfilterconfig1.FilterBank = 0; // CAN1 usa el banco 0
+  canfilterconfig1.FilterFIFOAssignment = CAN_RX_FIFO0;
+  canfilterconfig1.FilterIdHigh = 0x0000;
+  canfilterconfig1.FilterIdLow = 0x0000;
+  canfilterconfig1.FilterMaskIdHigh = 0x0000;
+  canfilterconfig1.FilterMaskIdLow = 0x0000;
+  canfilterconfig1.FilterMode = CAN_FILTERMODE_IDMASK;
+  canfilterconfig1.FilterScale = CAN_FILTERSCALE_32BIT;
+  canfilterconfig1.SlaveStartFilterBank = 14;
+  HAL_CAN_ConfigFilter(&hcan1, &canfilterconfig1);
+  
+  HAL_CAN_Start(&hcan1);
+  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+  HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 5, 0); 
+  HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
 }
 
 /**
@@ -632,16 +679,16 @@ void CAN_Safe_Transmit(uint32_t target_can_id, uint32_t payload_data, msg_type_t
       break;
     case MSG_TYPE_SYNC_REQUIRED:
       frame_to_send.msg_type = MSG_TYPE_SYNC_REQUIRED;
-      frame_to_send.payload_data = target_can_id;
+      frame_to_send.payload_data = payload_data;
       break;
     default:
       Error_Handler();
   }
-  ft_prepare_tx_frame(&frame_to_send, target_can_id);
+  ft_prepare_tx_frame(&frame_to_send, SLAVE1_ID); /* Master take SLAVE1_ID to avoid errors */
   // 3. Add data to the CAN payload
   memcpy(tx_data, &frame_to_send, sizeof(can_frame_payload_t));
   // 4. Transmit the message and check for errors
-  if (HAL_CAN_AddTxMessage(&hcan2, &tx_header, tx_data, &tx_mailbox) != HAL_OK) {
+  if (HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox) != HAL_OK) {
       // Podrías encender un LED de error de hardware aquí
       Error_Handler();
   }
@@ -693,7 +740,7 @@ void Task_ProcessData(void *argument) {
         
       /* Treatment of fault conditions */
       if (last_msg_status == FT_SYNC_REQUIRED) {
-        CAN_Safe_Transmit(msg_to_process.sender_id, 0, MSG_TYPE_SYNC_REQUIRED);
+        CAN_Safe_Transmit(MASTER_ID, msg_to_process.sender_id, MSG_TYPE_SYNC_REQUIRED);
       }
       else if (last_msg_status == FT_ERR_CRC_FAILED) {
         //TODO: Possible future improvement: Treatment of CRC errors (Count consecutive CRC errors are being treated in fault tolerance library, so you could check that count here and decide to mute a node if it exceeds a threshold)
@@ -737,7 +784,7 @@ void Reset_Slave_Context(uint8_t index) {
   slave_contexts[index].last_valid_data = 0;
   if (!slave_contexts[0].is_muted) {
     // If we are unmuting the node, we can also send a SYNC_REQUIRED message to ask it to resync immediately
-    CAN_Safe_Transmit(slave_contexts[index].slave_id, 0, MSG_TYPE_SYNC_REQUIRED);
+    CAN_Safe_Transmit(MASTER_ID, slave_contexts[index].slave_id, MSG_TYPE_SYNC_REQUIRED);
   }
 }
 
@@ -773,14 +820,14 @@ void Task_UpdateDisplay(void *argument) {
           }
           /* Check for control panel interactions */
           else if (actual_display == DISPLAY_CONTROL) {
-            if (y > 60 && y < 110) { 
-              Reset_Slave_Context(3);
-            }
-            else if (y > 120 && y < 170) { 
+            if (y > 50 && y < 110) { 
               Reset_Slave_Context(2);
             }
-            else if (y > 180 && y < 230) { 
+            else if (y > 110 && y < 170) { 
               Reset_Slave_Context(1);
+            }
+            else if (y > 170 && y < 230) { 
+              Reset_Slave_Context(0);
             }
           }
         }
@@ -837,7 +884,7 @@ void Task_UpdateDisplay(void *argument) {
         BSP_LCD_SetFont(&Font12);
         sprintf(txt, "Data: %04lu   ", slave_contexts[i].last_valid_data);
         print_at_anyfont(10, 60, txt);
-        sprintf(txt, "Seq number: %04lu   ", slave_contexts[i].expected_seq_num);
+        sprintf(txt, "Seq number: %02u   ", slave_contexts[i].expected_seq_num);
         print_at_anyfont(10, 80, txt);
         sprintf(txt, "Faults CRC: %lu    ", slave_contexts[i].stats_crc_errors);
         print_at_anyfont(10, 110, txt);
@@ -939,3 +986,8 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+
+void CAN1_RX0_IRQHandler(void)
+{
+  HAL_CAN_IRQHandler(&hcan1);
+}

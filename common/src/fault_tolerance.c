@@ -12,9 +12,12 @@ void ft_init_context() {
         slave_contexts[i].expected_seq_num = 0;
         slave_contexts[i].stats_crc_errors = 0;
         slave_contexts[i].stats_frames_lost = 0;
+        slave_contexts[i].stats_frames_ok = 0;
         slave_contexts[i].consecutive_crc_errors = 0;
+        slave_contexts[i].consecutive_seq_errors = 0;
         slave_contexts[i].is_muted = 0;
         slave_contexts[i].last_valid_data = 0;
+        slave_contexts[i].sync_attempts = 0;
     }
 }
 

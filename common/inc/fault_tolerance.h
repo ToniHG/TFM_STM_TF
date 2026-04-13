@@ -6,8 +6,8 @@
 
 /* Defines configuration */
 #define MAX_SEQ_NUM 255
-#define MAX_FRAME_LOSS 5
-#define MAX_FRAME_LOSS_CONSC 3
+#define MAX_FRAME_LOSS 10
+#define MAX_FRAME_LOSS_CONSC 5
 #define MAX_CRC_ERRORS 3
 #define SENSOR_MAX_VALID 5000
 /* ========================================================================= */
@@ -30,7 +30,7 @@ typedef enum {
 typedef struct {
     uint32_t slave_id;
     uint32_t last_valid_data;
-    uint32_t expected_seq_num;
+    uint8_t expected_seq_num;
     uint32_t stats_crc_errors;
     uint32_t stats_frames_lost;
     uint32_t stats_frames_ok;

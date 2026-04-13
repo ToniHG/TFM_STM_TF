@@ -43,7 +43,7 @@ QueueHandle_t sensor_mailbox;     // Mailbox (queue) for sending sensor data fro
 TaskHandle_t TaskSensors_Handle;  // Handle for the sensor reading task
 TaskHandle_t TaskCAN_Handle;      // Handle for the CAN sending task
 TaskHandle_t TaskProcess_Handle;  // Handle for the data processing task
-volatile uint8_t seq_counter = 0; // Sequence counter for messages, used in fault tolerance algorithm 1
+volatile uint8_t seq_counter = 1; // Sequence counter for messages, used in fault tolerance algorithm 1
 QueueHandle_t can_rx_queue;       // FreeRTOS queue to receive CAN messages from the ISR
 volatile uint32_t slave_id = SLAVE1_ID; // ID of this slave, should be set according to the hardware configuration (SLAVE1_ID, SLAVE2_ID, SLAVE3_ID)
 
@@ -146,7 +146,7 @@ void SystemClock_Config(void) {
 static void MX_CAN1_Init(void) {
   /* Initialize the CAN1 peripheral */
   hcan1.Instance = CAN1;
-  hcan1.Init.Prescaler = 6;
+  hcan1.Init.Prescaler = 24;
   hcan1.Init.Mode = CAN_MODE_NORMAL;
   hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
@@ -169,10 +169,15 @@ static void MX_CAN1_Init(void) {
   can_filter_config.FilterFIFOAssignment = CAN_RX_FIFO0;
   can_filter_config.FilterActivation = ENABLE;
   can_filter_config.SlaveStartFilterBank = 14;
+  /* Initialize CAN */
+  if (HAL_CAN_Init(&hcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* Start the CAN peripheral */
   if (HAL_CAN_ConfigFilter(&hcan1, &can_filter_config) != HAL_OK) {
       Error_Handler();
   }
-  /* Start the CAN peripheral */
   if (HAL_CAN_Start(&hcan1) != HAL_OK) {
       Error_Handler();
   }
@@ -400,7 +405,7 @@ void Task_SendCAN(void *argument) {
   tx_header.IDE = CAN_ID_STD;
   tx_header.RTR = CAN_RTR_DATA;
   tx_header.DLC = 8;
-
+  vTaskDelay(pdMS_TO_TICKS(5000));
   while(1) {
     /* Receive the latest sensor data */
     xQueueReceive(sensor_mailbox, &current_sensor_data, 0);
@@ -416,9 +421,12 @@ void Task_SendCAN(void *argument) {
         my_tx_frame.crc16 ^= 0xFFFF; 
     }
     memcpy(tx_data, &my_tx_frame, sizeof(can_frame_payload_t));
-    HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
-    seq_counter++;
-    vTaskDelay(pdMS_TO_TICKS(100));
+    if (HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox) == HAL_OK) {
+        seq_counter++; // Solo avanzamos la secuencia si el mensaje salió de verdad
+    } else {
+        // Aquí podríamos poner un toggle de un LED rojo para saber que el envío ha fallado (por ejemplo, por un error de bus)
+    }
+    vTaskDelay(pdMS_TO_TICKS(250));
   }
 }
 
@@ -438,11 +446,11 @@ void Task_ProcessData(void *argument) {
           msg_to_process.frame.payload_data == slave_id &&
           msg_to_process.frame.crc16 == calculate_crc16((uint8_t*)&msg_to_process.frame, sizeof(can_frame_payload_t) - sizeof(uint16_t))) {
           /* If we receive a SYNC_REQUIRED message, we can reset our sequence counter to resync with the master */
-          seq_counter = 1; // Reset to 1 because the slave will send the next message with seq=0 after sync
+          seq_counter = 1; // Reset to 1 because the slave will send the next message with seq=1 after sync
       }
       // TODO: Possible improvement more complex processing of the message, for example storing the last N messages and doing majority voting, etc.
     }
-    vTaskDelay(pdMS_TO_TICKS(25));
+    vTaskDelay(pdMS_TO_TICKS(150));
   }
 }
 

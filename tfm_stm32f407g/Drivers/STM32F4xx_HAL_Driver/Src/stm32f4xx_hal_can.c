@@ -1073,7 +1073,7 @@ HAL_StatusTypeDef HAL_CAN_Start(CAN_HandleTypeDef *hcan)
   else
   {
     /* Update error code */
-    hcan->ErrorCode |= HAL_CAN_ERROR_NOT_READY;
+      hcan->ErrorCode |= HAL_CAN_ERROR_NOT_READY;
 
     return HAL_ERROR;
   }
