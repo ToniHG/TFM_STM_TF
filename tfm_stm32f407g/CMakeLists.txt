@@ -48,6 +48,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ../common/src/can_protocol.c
     ../common/src/crc16.c
     ../common/src/fault_tolerance.c
+    Core/Src/radar.c
 )
 
 # Add include paths

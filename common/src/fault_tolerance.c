@@ -1,6 +1,7 @@
 #include "fault_tolerance.h"
 #include "crc16.h"
 #include <stddef.h>
+#include <string.h>
 
 /* Context with fault tolerance information for each slave */
 ft_context_t slave_contexts[3];
@@ -8,16 +9,8 @@ ft_context_t slave_contexts[3];
 /* Initialize fault tolerance context */
 void ft_init_context() {
     for(int i = 0; i < 3; i++) {
+        memset(&slave_contexts[i], 0, sizeof(ft_context_t)); // Initialize all fields to zero
         slave_contexts[i].slave_id = SLAVE1_ID + i; // Assign CAN IDs to the contexts
-        slave_contexts[i].expected_seq_num = 0;
-        slave_contexts[i].stats_crc_errors = 0;
-        slave_contexts[i].stats_frames_lost = 0;
-        slave_contexts[i].stats_frames_ok = 0;
-        slave_contexts[i].consecutive_crc_errors = 0;
-        slave_contexts[i].consecutive_seq_errors = 0;
-        slave_contexts[i].is_muted = 0;
-        slave_contexts[i].last_valid_data = 0;
-        slave_contexts[i].sync_attempts = 0;
     }
 }
 
@@ -79,9 +72,9 @@ ft_status_t ft_process_message(can_frame_payload_t *frame, uint32_t can_id) {
     ctx->consecutive_crc_errors = 0;
 
     /* Check sensor data credibility */
-    if (frame->payload_data > SENSOR_MAX_VALID) {
-        return FT_ERR_CREDIBILITY;
-    }
+    //if (frame->payload_data > SENSOR_MAX_VALID) {
+    //    return FT_ERR_CREDIBILITY;
+    //}
 
     /* Check sequence number */
     if (frame->seq_number != ctx->expected_seq_num) {
@@ -119,7 +112,8 @@ ft_status_t ft_process_message(can_frame_payload_t *frame, uint32_t can_id) {
     }
     /* No errors, update the expected sequence number and save the valid data */
     ctx->expected_seq_num = (frame->seq_number + 1); 
-    ctx->last_valid_data = frame->payload_data;
+    /* Copy up to 4 bytes of payload into last_valid_data (payload_data is a pointer) */
+    memcpy(&ctx->last_valid_data, &frame->payload_data, sizeof(ctx->last_valid_data));
 
     return FT_OK;
 }

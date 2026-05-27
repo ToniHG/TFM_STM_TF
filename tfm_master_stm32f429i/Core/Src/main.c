@@ -61,6 +61,7 @@ volatile ft_status_t last_msg_status = FT_OK; // Status of the last processed me
 QueueHandle_t can_rx_queue;                   // FreeRTOS queue to receive CAN messages from the ISR
 TaskHandle_t TaskProcess_Handle;              // Handle for the task that processes CAN messages
 TaskHandle_t TaskDisplay_Handle;              // Handle for the task that updates the display
+TaskHandle_t TaskWatchdog_Handle;             // Handle for the task that implements the watchdog functionality
 
 /* Enum for GUI states */
 typedef enum {
@@ -88,8 +89,10 @@ static void MX_TIM1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_LCD_Display_Init(void);
 void CAN_Safe_Transmit(uint32_t target_can_id, uint32_t payload_data, msg_type_t msg_status);
-void Task_ProcessData(void *argument);
-void Task_UpdateDisplay(void *argument);
+void Reset_Slave_Context(uint8_t index);
+void vProcessDataTask(void *argument);
+void vUpdateDisplayTask(void *argument);
+void vWatchdogTask(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /**
@@ -115,9 +118,11 @@ int main(void) {
   /* Create the queue for CAN messages */
   can_rx_queue = xQueueCreate(10, sizeof(rtos_can_msg_t));
   /* Create the task for processing CAN messages high priority */
-  xTaskCreate(Task_ProcessData, "Proccesador", 256, NULL, 2, &TaskProcess_Handle);
+  xTaskCreate(vProcessDataTask, "Proccesador", 256, NULL, 2, &TaskProcess_Handle);
   /* Create the task for updating the display low priority */
-  xTaskCreate(Task_UpdateDisplay, "Display", 256, NULL, 1, &TaskDisplay_Handle);
+  xTaskCreate(vUpdateDisplayTask, "Display", 256, NULL, 1, &TaskDisplay_Handle);
+  /* Create the task for the watchdog */
+  xTaskCreate(vWatchdogTask, "Watchdog", 256, NULL, 2, &TaskWatchdog_Handle);
   /* Start scheduler */
   vTaskStartScheduler();
 
@@ -199,34 +204,6 @@ static void MX_CAN2_Init(void) {
   hcan2.Init.AutoRetransmission = DISABLE;
   hcan2.Init.ReceiveFifoLocked = DISABLE;
   hcan2.Init.TransmitFifoPriority = DISABLE;
-  /* Configure  CAN filter to listen to all messages 
-  CAN_FilterTypeDef canfilterconfig;
-  canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
-  canfilterconfig.FilterBank = 14;
-  canfilterconfig.FilterFIFOAssignment = CAN_RX_FIFO0;
-  canfilterconfig.FilterIdHigh = 0x0000;
-  canfilterconfig.FilterIdLow = 0x0000;
-  canfilterconfig.FilterMaskIdHigh = 0x0000;
-  canfilterconfig.FilterMaskIdLow = 0x0000;
-  canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
-  canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
-  canfilterconfig.SlaveStartFilterBank = 14;
-
-  /* Initialize CAN 
-  if (HAL_CAN_Init(&hcan2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* Initialize CAN filter and interrupts for reception 
-  if (HAL_CAN_ConfigFilter(&hcan2, &canfilterconfig) != HAL_OK) {
-      Error_Handler();
-  }
-  if (HAL_CAN_Start(&hcan2) != HAL_OK) {
-      Error_Handler();
-  }
-  if (HAL_CAN_ActivateNotification(&hcan2, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
-      Error_Handler();
-  }*/
 
   __HAL_RCC_CAN1_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -655,13 +632,15 @@ static void MX_LCD_Display_Init(void) {
  * @param  msg_status: Status of the message to send, returned by ft_process_message 
  */
 void CAN_Safe_Transmit(uint32_t target_can_id, uint32_t payload_data, msg_type_t msg_type) {
+
   CAN_TxHeaderTypeDef tx_header;
   can_frame_payload_t frame_to_send;
   uint32_t tx_mailbox;
   uint8_t tx_data[8];
+  memset(&frame_to_send, 0, sizeof(can_frame_payload_t));
 
   // 1. Configure CAN Header
-  tx_header.StdId = target_can_id; 
+  tx_header.StdId = MASTER_ID;
   tx_header.ExtId = 0;
   tx_header.IDE = CAN_ID_STD;
   tx_header.RTR = CAN_RTR_DATA;
@@ -671,15 +650,9 @@ void CAN_Safe_Transmit(uint32_t target_can_id, uint32_t payload_data, msg_type_t
   switch (msg_type) {
     case MSG_TYPE_HEARTBEAT:
       frame_to_send.msg_type = MSG_TYPE_HEARTBEAT;
-      frame_to_send.payload_data = payload_data;
-      break;
-    case MSG_TYPE_SENSOR_DATA:
-      frame_to_send.msg_type = MSG_TYPE_SENSOR_DATA;
-      frame_to_send.payload_data = payload_data;
       break;
     case MSG_TYPE_SYNC_REQUIRED:
       frame_to_send.msg_type = MSG_TYPE_SYNC_REQUIRED;
-      frame_to_send.payload_data = payload_data;
       break;
     default:
       Error_Handler();
@@ -729,24 +702,65 @@ void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef *hcan) {
  * @param  argument: Not used, but it's a pointer that you could use to pass data to the task if you wanted
  * @retval None
  */
-void Task_ProcessData(void *argument) {
+void vProcessDataTask(void *argument) {
   /* Data to process from Queue */
   rtos_can_msg_t msg_to_process;
 
   while(1) {
+
     if (xQueueReceive(can_rx_queue, &msg_to_process, 0) == pdPASS) {
-      /* Process the message with the Fault Tolerance library to check CRC and sequence */
-      last_msg_status = ft_process_message(&msg_to_process.frame, msg_to_process.sender_id);
-        
-      /* Treatment of fault conditions */
-      if (last_msg_status == FT_SYNC_REQUIRED) {
-        CAN_Safe_Transmit(MASTER_ID, msg_to_process.sender_id, MSG_TYPE_SYNC_REQUIRED);
-      }
-      else if (last_msg_status == FT_ERR_CRC_FAILED) {
-        //TODO: Possible future improvement: Treatment of CRC errors (Count consecutive CRC errors are being treated in fault tolerance library, so you could check that count here and decide to mute a node if it exceeds a threshold)
+      /* Determine the index of the slave based on its ID */
+      uint8_t idx = 0;
+      if (msg_to_process.sender_id == SLAVE1_ID) idx = 0;
+      else if (msg_to_process.sender_id == SLAVE2_ID) idx = 1;
+      else if (msg_to_process.sender_id == SLAVE3_ID) idx = 2;
+      else continue; /* If the sender ID is not recognized, skip the rest of the processing */
+      /* Process the message based on its type */
+      if (msg_to_process.frame.msg_type == MSG_TYPE_HEARTBEAT) {
+        /* Analyze the first byte sent by the slave with the HC-SR04 status */
+        if (msg_to_process.frame.payload_data[0] == 0x01) {
+          slave_contexts[idx].hardware_fault = 1;
+          slave_contexts[idx].is_muted = 1;
+        } else {
+          if (slave_contexts[idx].hardware_fault || slave_contexts[idx].is_muted) {
+            Reset_Slave_Context(idx);
+          }
+          /* Update the last seen timestamp */
+          slave_contexts[idx].last_seen_ticks = xTaskGetTickCount();
+          slave_contexts[idx].is_muted = 0;
+        }
+      } 
+      else if (msg_to_process.frame.msg_type == MSG_TYPE_RADAR_DATA) {
+        /* Process radar data with fault tolerance */
+        last_msg_status = ft_process_message(&msg_to_process.frame, msg_to_process.sender_id);
+          
+        if (last_msg_status == FT_SYNC_REQUIRED) {
+          CAN_Safe_Transmit(MASTER_ID, msg_to_process.sender_id, MSG_TYPE_SYNC_REQUIRED);
+        }
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(150));
+  }
+}
+
+/**
+ * @brief  Task of FreeRTOS to watchdog the slave nodes and mute them if they haven't sent a message in a long time (e.g., 5 seconds)
+ * @param  argument: Not used, but it's a pointer that you could use to pass data to the task if you wanted
+ * @retval None
+ */
+void vWatchdogTask(void *argument) {
+  while(1) {
+    TickType_t current_time = xTaskGetTickCount();
+    
+    for(int i = 0; i < 3; i++) {
+      /* Si han pasado > 5000 ms desde el último mensaje recibido */
+      if ((current_time - slave_contexts[i].last_seen_ticks) > pdMS_TO_TICKS(5000)) {
+        if (!slave_contexts[i].is_muted) {
+          slave_contexts[i].is_muted = 1;
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000)); /* Revisa cada 1 segundo */
   }
 }
 
@@ -781,7 +795,9 @@ void Reset_Slave_Context(uint8_t index) {
   slave_contexts[index].consecutive_seq_errors = 0;
   slave_contexts[index].sync_attempts = 0;
   slave_contexts[index].expected_seq_num = 0;
-  slave_contexts[index].last_valid_data = 0;
+  slave_contexts[index].hardware_fault = 0;
+  slave_contexts[index].last_seen_ticks = xTaskGetTickCount();
+  memset(slave_contexts[index].last_valid_data, 0, sizeof(uint32_t));
   if (!slave_contexts[0].is_muted) {
     // If we are unmuting the node, we can also send a SYNC_REQUIRED message to ask it to resync immediately
     CAN_Safe_Transmit(MASTER_ID, slave_contexts[index].slave_id, MSG_TYPE_SYNC_REQUIRED);
@@ -793,7 +809,7 @@ void Reset_Slave_Context(uint8_t index) {
  * @param  argument: No se usa, pero es un puntero que podrías usar para pasar datos a la tarea si quisieras
  * @retval None
  */
-void Task_UpdateDisplay(void *argument) {
+void vUpdateDisplayTask(void *argument) {
   char txt[40];
   TS_StateTypeDef TS_State;
 
@@ -882,7 +898,21 @@ void Task_UpdateDisplay(void *argument) {
         
         BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
         BSP_LCD_SetFont(&Font12);
-        sprintf(txt, "Data: %04lu   ", slave_contexts[i].last_valid_data);
+        /* Display the last valid data received from the slave (angle and distance) */
+        uint8_t angle = slave_contexts[i].last_valid_data[0];
+        uint16_t dist = (slave_contexts[i].last_valid_data[1] << 8) | slave_contexts[i].last_valid_data[2];
+        if (slave_contexts[i].is_muted) {
+          sprintf(txt, "Dist: --- cm | Ang: ---");
+          print_at_anyfont(10, 60, txt);
+        } 
+        else {
+          if (dist == 0xFFFF) {
+            sprintf(txt, "Dist: OUT OF RANGE | Ang: %03u", angle);
+          } else {
+            sprintf(txt, "Dist: %03u cm | Ang: %03u", dist, angle);
+          }
+          print_at_anyfont(10, 60, txt);
+        }
         print_at_anyfont(10, 60, txt);
         sprintf(txt, "Seq number: %02u   ", slave_contexts[i].expected_seq_num);
         print_at_anyfont(10, 80, txt);
@@ -893,14 +923,20 @@ void Task_UpdateDisplay(void *argument) {
 
         /* Actual state */
         if (slave_contexts[i].is_muted) {
-          BSP_LCD_SetTextColor(LCD_COLOR_RED);
-          print_at_anyfont(10, 160, "ESTADO: MUTEADO (RED)");
+          BSP_LCD_SetTextColor(LCD_COLOR_RED);TickType_t age = xTaskGetTickCount() - slave_contexts[i].last_seen_ticks;
+          if (age > pdMS_TO_TICKS(5000)) {
+            print_at_anyfont(10, 160, "STATUS: TIMEOUT      ");
+          } else if (slave_contexts[i].hardware_fault) {
+            print_at_anyfont(10, 160, "STATUS: HW FAULT     ");
+          } else {
+            print_at_anyfont(10, 160, "STATUS: MUTED        ");
+          }
         } else if (slave_contexts[i].consecutive_crc_errors > 0) {
           BSP_LCD_SetTextColor(LCD_COLOR_ORANGE);
-          print_at_anyfont(10, 160, "ESTADO: ALERTA CRC!  ");
+          print_at_anyfont(10, 160, "STATUS: ALERT CRC!   ");
         } else {
           BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
-          print_at_anyfont(10, 160, "ESTADO: ACTIVO (OK)  ");
+          print_at_anyfont(10, 160, "STATUS: ACTIVE (OK)  ");
         }
       }
     }

@@ -14,10 +14,14 @@
   * If no LICENSE file comes with this software, it is provided AS-IS.
   *
   ******************************************************************************
+  * @author  Antonio Hermoso García
+  * @date    2026
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
+#include "usb_host.h"
 #include "can_protocol.h"
 #include "fault_tolerance.h"
 #include "crc16.h"
@@ -27,6 +31,9 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
+#include "radar.h"
+
+/* Private includes ----------------------------------------------------------*/
 
 /* Private typedef -----------------------------------------------------------*/
 
@@ -38,14 +45,15 @@
 CAN_HandleTypeDef hcan1;          // CAN1 handle for communication
 I2C_HandleTypeDef hi2c1;          // I2C1 handle for sensor communication
 I2S_HandleTypeDef hi2s3;          // I2S3 handle for audio (not used in this example but initialized)
-SPI_HandleTypeDef hspi1;          // SPI1 handle for other peripherals (not used in this example but initialized)
-QueueHandle_t sensor_mailbox;     // Mailbox (queue) for sending sensor data from Task_ReadSensors to Task_SendCAN
+TIM_HandleTypeDef htim2;          // TIM2 handle for input capture (HC-SR04 Echo)
+TIM_HandleTypeDef htim3;          // TIM3 handle for PWM generation (SG90 Servo)
 TaskHandle_t TaskSensors_Handle;  // Handle for the sensor reading task
 TaskHandle_t TaskCAN_Handle;      // Handle for the CAN sending task
 TaskHandle_t TaskProcess_Handle;  // Handle for the data processing task
 volatile uint8_t seq_counter = 1; // Sequence counter for messages, used in fault tolerance algorithm 1
-QueueHandle_t can_rx_queue;       // FreeRTOS queue to receive CAN messages from the ISR
+QueueHandle_t can_tx_queue;       // FreeRTOS queue to send CAN messages via vSendCANTask
 volatile uint32_t slave_id = SLAVE1_ID; // ID of this slave, should be set according to the hardware configuration (SLAVE1_ID, SLAVE2_ID, SLAVE3_ID)
+volatile uint8_t g_slave_hw_status = 0x00; // Hardware status of this slave (0x00 = OK_RUNNING, 0x01 = FAULTY, 0xFF = MUTED)
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -53,10 +61,10 @@ static void MX_GPIO_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2S3_Init(void);
-static void MX_SPI1_Init(void);
-void Task_ReadSensors(void *argument);
-void Task_SendCAN(void *argument);
-void Task_ProcessData(void *argument);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
+void vSendCANTask(void *argument);
+void vHeartbeatTask(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 
@@ -65,9 +73,11 @@ void Task_ProcessData(void *argument);
   * @retval int
   */
 int main(void) {
+
   /* MCU Configuration--------------------------------------------------------*/
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+  HAL_DBGMCU_EnableDBGSleepMode();
   /* Configure the system clock */
   SystemClock_Config();
   /* Initialize all configured peripherals */
@@ -75,18 +85,19 @@ int main(void) {
   MX_CAN1_Init();
   MX_I2C1_Init();
   MX_I2S3_Init();
-  MX_SPI1_Init();
-  /* Initialize sensor queue */
-  sensor_mailbox = xQueueCreate(1, sizeof(uint32_t));
-  /* Create the queue for CAN messages */
-  can_rx_queue = xQueueCreate(10, sizeof(rtos_can_msg_t));
-  /* Create tasks */
-  xTaskCreate(Task_ReadSensors, "Read_Sensors", 128, NULL, 2, &TaskSensors_Handle);
-  xTaskCreate(Task_SendCAN, "Send_CAN", 256, NULL, 1, &TaskCAN_Handle);
-  xTaskCreate(Task_ProcessData, "Process_Data", 256, NULL, 2, &TaskProcess_Handle);
+  MX_TIM2_Init();
+  MX_TIM3_Init();
+  /* Initialize */
+  can_tx_queue = xQueueCreate(10, sizeof(can_frame_payload_t));
+  xTaskCreate(vSendCANTask, "Send_CAN", 256, NULL, 1, &TaskCAN_Handle);
+  xTaskCreate(vHeartbeatTask, "Heartbeat", 128, NULL, 1, NULL);
+  /* Initialize the radar application */
+  if (Radar_Init() != pdTRUE)
+  {
+    Error_Handler();
+  }
   /* Start scheduler */
   vTaskStartScheduler();
-
   /* Infinite loop */
   while (1)
   {
@@ -99,14 +110,13 @@ int main(void) {
   * @retval None
   */
 void SystemClock_Config(void) {
+
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
   /** Configure the main internal regulator output voltage
   */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
@@ -122,7 +132,6 @@ void SystemClock_Config(void) {
   {
     Error_Handler();
   }
-
   /** Initializes the CPU, AHB and APB buses clocks
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
@@ -144,7 +153,8 @@ void SystemClock_Config(void) {
   * @retval None
   */
 static void MX_CAN1_Init(void) {
-  /* Initialize the CAN1 peripheral */
+
+  /* Initialize instance CAN1 */
   hcan1.Instance = CAN1;
   hcan1.Init.Prescaler = 24;
   hcan1.Init.Mode = CAN_MODE_NORMAL;
@@ -176,14 +186,14 @@ static void MX_CAN1_Init(void) {
   }
   /* Start the CAN peripheral */
   if (HAL_CAN_ConfigFilter(&hcan1, &can_filter_config) != HAL_OK) {
-      Error_Handler();
+    Error_Handler();
   }
   if (HAL_CAN_Start(&hcan1) != HAL_OK) {
-      Error_Handler();
+    Error_Handler();
   }
   /* Activate CAN RX interrupt */
   if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
-      Error_Handler();
+    Error_Handler();
   }
 }
 
@@ -193,6 +203,7 @@ static void MX_CAN1_Init(void) {
   * @retval None
   */
 static void MX_I2C1_Init(void) {
+
   hi2c1.Instance = I2C1;
   hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -214,6 +225,7 @@ static void MX_I2C1_Init(void) {
   * @retval None
   */
 static void MX_I2S3_Init(void) {
+
   hi2s3.Instance = SPI3;
   hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
   hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
@@ -230,28 +242,76 @@ static void MX_I2S3_Init(void) {
 }
 
 /**
-  * @brief SPI1 Initialization Function
+  * @brief TIM2 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_SPI1_Init(void) {
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 10;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+static void MX_TIM2_Init(void) {
+
+  /* Initialize TIM2 */
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 83;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4294967295;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_IC_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
   }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void) {
+
+  /* Initialize TIM3 */
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 83;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 19999;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  HAL_TIM_MspPostInit(&htim3);
 }
 
 /**
@@ -260,6 +320,7 @@ static void MX_SPI1_Init(void) {
   * @retval None
   */
 static void MX_GPIO_Init(void) {
+
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
@@ -272,6 +333,8 @@ static void MX_GPIO_Init(void) {
   HAL_GPIO_WritePin(CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin, GPIO_PIN_RESET);
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_RESET);
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
                           |Audio_RST_Pin, GPIO_PIN_RESET);
@@ -299,6 +362,19 @@ static void MX_GPIO_Init(void) {
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+  /*Configure GPIO pin : PA2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  /*Configure GPIO pins : SPI1_SCK_Pin SPI1_MOSI_Pin */
+  GPIO_InitStruct.Pin = SPI1_SCK_Pin|SPI1_MOSI_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
   /*Configure GPIO pin : BOOT1_Pin */
   GPIO_InitStruct.Pin = BOOT1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
@@ -331,9 +407,76 @@ static void MX_GPIO_Init(void) {
   HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
 }
 
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
 /**
- * @brief  Callback universal de Recepción (Salta automáticamente al llegar un mensaje)
- * @param  hcan: Puntero al periférico CAN que ha recibido el mensaje (ej. &hcan1 o &hcan2)
+  * @brief  Task of FreeRTOS to send CAN messages with sensor data every time defined.
+  * @param  argument: Not used
+  * @retval None
+  */
+void vSendCANTask(void *argument) {
+
+  CAN_TxHeaderTypeDef tx_header;
+  uint32_t tx_mailbox;
+  can_frame_payload_t my_tx_frame;
+  uint8_t tx_data[8];
+  /* Configure the header for this slave */
+  tx_header.StdId = slave_id; /* This value should be changed for each slave (SLAVE1_ID, SLAVE2_ID, SLAVE3_ID)*/
+  tx_header.ExtId = 0;
+  tx_header.IDE = CAN_ID_STD;
+  tx_header.RTR = CAN_RTR_DATA;
+  tx_header.DLC = 8;
+  while(1) {
+    /* Receive the latest sensor data */
+    memset(&my_tx_frame, 0, sizeof(can_frame_payload_t));
+    /* If data is available in the queue */
+    if (xQueueReceive(can_tx_queue, &my_tx_frame, portMAX_DELAY) == pdTRUE) {
+      /* Arm the message */
+      my_tx_frame.seq_number = seq_counter;
+      /* Calculate the CRC */
+      my_tx_frame.crc16 = calculate_crc16((uint8_t*)&my_tx_frame, 6);
+      /* Fault Injection */
+      if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET) {
+        /* If the fault injection button is pressed, invert the CRC bits */
+        my_tx_frame.crc16 ^= 0xFFFF; 
+      }
+      memcpy(tx_data, &my_tx_frame, sizeof(can_frame_payload_t));
+      if (HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox) == HAL_OK) {
+        seq_counter++; 
+      } else {
+        NULL;
+      }
+    }
+  }
+}
+
+/**
+  * @brief  Independent task to report the node heartbeat to the Master.
+  */
+void vHeartbeatTask(void *argument) {
+  can_frame_payload_t hb_frame;
+  
+  while(1) {
+    /* Clear the frame to avoid sending uninitialized memory */
+    memset(&hb_frame, 0, sizeof(can_frame_payload_t));
+    
+    /* Set as heartbeat message */
+    hb_frame.msg_type = MSG_TYPE_HEARTBEAT;
+    hb_frame.payload_data[0] = g_slave_hw_status; /* Status: 0x00 = OK_RUNNING, 0x01 = ERROR_SENSOR, 0x02 = ERROR_COMMUNICATION */
+    
+    /* Send to the queue for vSendCANTask to transmit */
+    xQueueSend(can_tx_queue, &hb_frame, portMAX_DELAY);
+    
+    /* Sleep the task exactly 1 second */
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+/**
+ * @brief  Universal RX callback (Automatically invoked when a message arrives)
+ * @param  hcan: Pointer to the CAN peripheral that received the message (e.g. &hcan1 or &hcan2)
  * @retval None
  */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
@@ -350,107 +493,8 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
     if (incoming_msg.sender_id == MASTER_ID) {
       memcpy(&incoming_msg.frame, rx_data, sizeof(can_frame_payload_t));
       /* Send the received message to the FreeRTOS queue */
-      xQueueSendFromISR(can_rx_queue, &incoming_msg, &xHigherPriorityTaskWoken);
       portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
     }
-    
-  }
-}
-
-/**
- * @brief  Callback de interrupción: Confirma que el envío terminó con éxito
- */
-void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef *hcan) {
-    // Aquí puedes poner un toggle de un LED verde para saber que el cableado está bien
-}
-
-/**
-  * @brief  Task of FreeRTOS to read sensors data.
-  * @param  argument: Not used
-  * @retval None
-  */
-void Task_ReadSensors(void *argument) {
-
-  uint32_t raw_sensor_value = 0;
-
-  while(1) {
-    // Simulamos que el sensor sube poco a poco
-    raw_sensor_value++;
-
-    // Metemos el dato en el buzón. 
-    // xQueueOverwrite machaca el dato viejo si el CAN aún no lo ha leído, 
-    // garantizando que siempre se envía lo más fresco.
-    xQueueOverwrite(sensor_mailbox, &raw_sensor_value);
-
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-}
-
-/**
-  * @brief  Task of FreeRTOS to send CAN messages with sensor data every time defined.
-  * @param  argument: Not used
-  * @retval None
-  */
-void Task_SendCAN(void *argument) {
-
-  CAN_TxHeaderTypeDef tx_header;
-  uint32_t tx_mailbox;
-  can_frame_payload_t my_tx_frame;
-  uint8_t tx_data[8];
-  uint32_t current_sensor_data = 0;
-
-  /* Configure the header for this slave */
-  tx_header.StdId = slave_id; /* This value should be changed for each slave (SLAVE1_ID, SLAVE2_ID, SLAVE3_ID)*/
-  tx_header.ExtId = 0;
-  tx_header.IDE = CAN_ID_STD;
-  tx_header.RTR = CAN_RTR_DATA;
-  tx_header.DLC = 8;
-  vTaskDelay(pdMS_TO_TICKS(5000));
-  while(1) {
-    /* Receive the latest sensor data */
-    xQueueReceive(sensor_mailbox, &current_sensor_data, 0);
-    /* Arm the message */
-    my_tx_frame.msg_type = MSG_TYPE_SENSOR_DATA;
-    my_tx_frame.seq_number = seq_counter;
-    my_tx_frame.payload_data = current_sensor_data;
-    /* Calculate the CRC */
-    my_tx_frame.crc16 = calculate_crc16((uint8_t*)&my_tx_frame, 6);
-    /* Fault Injection */
-    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET) {
-        /* If the fault injection button is pressed, invert the CRC bits */
-        my_tx_frame.crc16 ^= 0xFFFF; 
-    }
-    memcpy(tx_data, &my_tx_frame, sizeof(can_frame_payload_t));
-    if (HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox) == HAL_OK) {
-        seq_counter++; // Solo avanzamos la secuencia si el mensaje salió de verdad
-    } else {
-        // Aquí podríamos poner un toggle de un LED rojo para saber que el envío ha fallado (por ejemplo, por un error de bus)
-    }
-    vTaskDelay(pdMS_TO_TICKS(250));
-  }
-}
-
-/**
- * @brief  Task of FreeRTOS to process received CAN messages and apply Fault Tolerance treatment
- * @param  argument: Not used, but it's a pointer that you could use to pass data to the task if you wanted
- * @retval None
- */
-void Task_ProcessData(void *argument) {
-  /* Data to process from Queue */
-  rtos_can_msg_t msg_to_process;
-
-  while(1) {
-    if (xQueueReceive(can_rx_queue, &msg_to_process, 0) == pdPASS) {
-      /* Process the message with the Fault Tolerance library to check CRC and sequence */
-      if (msg_to_process.frame.msg_type == MSG_TYPE_SYNC_REQUIRED &&
-          msg_to_process.frame.payload_data == slave_id &&
-          msg_to_process.frame.crc16 == calculate_crc16((uint8_t*)&msg_to_process.frame, sizeof(can_frame_payload_t) - sizeof(uint16_t))) {
-          /* If we receive a SYNC_REQUIRED message, we can reset our sequence counter to resync with the master */
-          seq_counter = 1; // Reset to 1 because the slave will send the next message with seq=1 after sync
-      }
-      // TODO: Possible improvement more complex processing of the message, for example storing the last N messages and doing majority voting, etc.
-    }
-    vTaskDelay(pdMS_TO_TICKS(150));
   }
 }
 
@@ -458,7 +502,8 @@ void Task_ProcessData(void *argument) {
   * @brief  This function is executed in case of error occurrence.
   * @retval None
   */
-void Error_Handler(void) {
+void Error_Handler(void)
+{
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();

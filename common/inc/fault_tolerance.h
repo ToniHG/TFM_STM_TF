@@ -3,12 +3,14 @@
 
 #include "can_protocol.h"
 #include <stdint.h>
+#include "FreeRTOS.h"
+#include "task.h"
 
 /* Defines configuration */
 #define MAX_SEQ_NUM 255
 #define MAX_FRAME_LOSS 10
 #define MAX_FRAME_LOSS_CONSC 5
-#define MAX_CRC_ERRORS 3
+#define MAX_CRC_ERRORS 5
 #define SENSOR_MAX_VALID 5000
 /* ========================================================================= */
 /* CODES FOR DATA PROCESSING                                                 */
@@ -29,7 +31,7 @@ typedef enum {
 /* ========================================================================= */
 typedef struct {
     uint32_t slave_id;
-    uint32_t last_valid_data;
+    uint8_t last_valid_data[4];
     uint8_t expected_seq_num;
     uint32_t stats_crc_errors;
     uint32_t stats_frames_lost;
@@ -38,6 +40,8 @@ typedef struct {
     uint8_t  consecutive_seq_errors;
     uint8_t  sync_attempts;
     uint8_t  is_muted;
+    TickType_t last_seen_ticks;
+    uint8_t    hardware_fault;
 } ft_context_t;
 
 /* Context with fault tolerance information for each slave */

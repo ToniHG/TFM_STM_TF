@@ -20,12 +20,7 @@ void can_proto_init_frame(can_frame_payload_t *frame) {
  * @param  sensor_value: El valor de 32 bits que queremos enviar.
  */
 void can_proto_pack_sensor_data(can_frame_payload_t *frame, uint32_t sensor_value) {
-    can_proto_init_frame(frame);
-    frame->msg_type = MSG_TYPE_SENSOR_DATA;
-    frame->payload_data = sensor_value;
-
-    // Nota: El seq_number y el crc16 NO se rellenan aquí.
-    // Se encarga de ello la función ft_prepare_tx_frame() de tolerancia a fallos.
+    NULL;
 }
 
 /**
@@ -33,9 +28,7 @@ void can_proto_pack_sensor_data(can_frame_payload_t *frame, uint32_t sensor_valu
  * @param  status_code: Un código de estado (ej. 0 = OK, 1 = Error de hardware local).
  */
 void can_proto_pack_heartbeat(can_frame_payload_t *frame, uint32_t status_code) {
-    can_proto_init_frame(frame);
-    frame->msg_type = MSG_TYPE_HEARTBEAT;
-    frame->payload_data = status_code;
+    NULL;
 }
 
 /**
@@ -43,7 +36,5 @@ void can_proto_pack_heartbeat(can_frame_payload_t *frame, uint32_t status_code) 
  * @param  fault_code: El tipo de fallo a simular en el nodo receptor.
  */
 void can_proto_pack_fault_injection(can_frame_payload_t *frame, uint32_t fault_code) {
-    can_proto_init_frame(frame);
-    frame->msg_type = MSG_TYPE_FAULT_INJECT;
-    frame->payload_data = fault_code;
+    NULL;
 }

@@ -18,7 +18,7 @@
 /* ========================================================================= */
 typedef enum {
     MSG_TYPE_HEARTBEAT     = 0x01, // Heartbeat to check if the node is alive
-    MSG_TYPE_SENSOR_DATA   = 0x02, // Sensor data from Slave to Master (Low priority)
+    MSG_TYPE_RADAR_DATA   = 0x02, // Sensor data from Slave to Master (Low priority)
     MSG_TYPE_ACTUATOR_CMD  = 0x03, // Commands from Master to Slave to control actuators
     MSG_TYPE_FAULT_INJECT  = 0xFE, // Message to inject a fault for testing purposes (used in fault tolerance algorithm 2)
     MSG_TYPE_SYNC_REQUIRED = 0xFF  // Message from Master to Slaves to request synchronization (used in fault tolerance algorithm 1)
@@ -29,15 +29,15 @@ typedef enum {
 /* ========================================================================= */
 
 typedef struct __attribute__((packed)) {
-    uint8_t  msg_type       : 8;   // Byte 0: Message type (ej. heartbeat, sensor data, etc.)
-    uint8_t  seq_number     : 8;   // Byte 1: Sequence number for fault tolerance (Algorithm 1)
-    uint32_t payload_data   : 32;  // Bytes 2-5: Data for the message (ej. sensor reading, status code, etc.)
-    uint16_t crc16          : 16;  // Bytes 6-7: Checksum CRC16 (Algorithm 2)
+    uint8_t  msg_type;             // Byte 0: Message type (ej. heartbeat, sensor data, etc.)
+    uint8_t  seq_number;           // Byte 1: Sequence number for fault tolerance (Algorithm 1)
+    uint8_t  payload_data[4];      // Bytes 2-5: Data for the message (ej. sensor reading, status code, etc.)
+    uint16_t crc16;                // Bytes 6-7: Checksum CRC16 (Algorithm 2)
 } can_frame_payload_t;
 
 /* Structure for RTOS CAN messages */
 typedef struct {
-    uint32_t sender_id;
+    uint8_t sender_id;
     can_frame_payload_t frame;
 } rtos_can_msg_t;
 
