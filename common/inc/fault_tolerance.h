@@ -22,7 +22,8 @@ typedef enum {
     FT_ERR_FRAME_LOST   = -2,
     FT_ERR_MUTED        = -3,
     FT_ERR_CREDIBILITY  = -4,
-    FT_SYNC_REQUIRED    = -5
+    FT_SYNC_REQUIRED    = -5,
+    FT_ERR_UNKNOWN_ID   = -6
 } ft_status_t;
 
 /* ========================================================================= */
@@ -33,6 +34,7 @@ typedef struct {
     uint32_t slave_id;
     uint8_t last_valid_data[4];
     uint8_t expected_seq_num;
+    uint8_t waiting_for_sync;
     uint32_t stats_crc_errors;
     uint32_t stats_frames_lost;
     uint32_t stats_frames_ok;

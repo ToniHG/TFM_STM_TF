@@ -27,6 +27,7 @@
 #include "stm32f429i_discovery_sdram.h"
 #include "stm32f429i_discovery_ts.h"
 #include "FreeRTOS.h"
+#include "stm32f4xx.h"
 #include "stm32f4xx_hal_can.h"
 #include "task.h"
 #include "queue.h"
@@ -122,7 +123,7 @@ int main(void) {
   /* Create the task for updating the display low priority */
   xTaskCreate(vUpdateDisplayTask, "Display", 256, NULL, 1, &TaskDisplay_Handle);
   /* Create the task for the watchdog */
-  xTaskCreate(vWatchdogTask, "Watchdog", 256, NULL, 2, &TaskWatchdog_Handle);
+  xTaskCreate(vWatchdogTask, "Watchdog", 256, NULL, 1, &TaskWatchdog_Handle);
   /* Start scheduler */
   vTaskStartScheduler();
 
@@ -199,22 +200,11 @@ static void MX_CAN2_Init(void) {
   hcan2.Init.TimeSeg1 = CAN_BS1_7TQ;
   hcan2.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan2.Init.TimeTriggeredMode = DISABLE;
-  hcan2.Init.AutoBusOff = DISABLE;
+  hcan2.Init.AutoBusOff = ENABLE;
   hcan2.Init.AutoWakeUp = DISABLE;
   hcan2.Init.AutoRetransmission = DISABLE;
   hcan2.Init.ReceiveFifoLocked = DISABLE;
   hcan2.Init.TransmitFifoPriority = DISABLE;
-
-  __HAL_RCC_CAN1_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  GPIO_InitStruct.Pin = GPIO_PIN_11 | GPIO_PIN_12;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF9_CAN1;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   hcan1.Instance = CAN1;
   hcan1.Init.Prescaler = 24;      // 45MHz / 36 / 12TQ = 125 kbps (Igual que el esclavo)
@@ -223,12 +213,11 @@ static void MX_CAN2_Init(void) {
   hcan1.Init.TimeSeg1 = CAN_BS1_12TQ;
   hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan1.Init.TimeTriggeredMode = DISABLE;
-  hcan1.Init.AutoBusOff = DISABLE;
-  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoBusOff = ENABLE;
+  hcan1.Init.AutoWakeUp = ENABLE;
   hcan1.Init.AutoRetransmission = ENABLE; 
   hcan1.Init.ReceiveFifoLocked = DISABLE;
   hcan1.Init.TransmitFifoPriority = DISABLE;
-  HAL_CAN_Init(&hcan1);
 
   CAN_FilterTypeDef canfilterconfig1;
   canfilterconfig1.FilterActivation = CAN_FILTER_ENABLE;
@@ -241,13 +230,22 @@ static void MX_CAN2_Init(void) {
   canfilterconfig1.FilterMode = CAN_FILTERMODE_IDMASK;
   canfilterconfig1.FilterScale = CAN_FILTERSCALE_32BIT;
   canfilterconfig1.SlaveStartFilterBank = 14;
-  HAL_CAN_ConfigFilter(&hcan1, &canfilterconfig1);
-  
-  HAL_CAN_Start(&hcan1);
-  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
-
-  HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 5, 0); 
-  HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
+  /* Initialize CAN */
+  if (HAL_CAN_Init(&hcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* Start the CAN peripheral */
+  if (HAL_CAN_ConfigFilter(&hcan1, &canfilterconfig1) != HAL_OK) {
+    Error_Handler();
+  }
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+    Error_Handler();
+  }
+  /* Activate CAN RX interrupt */
+  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
+    Error_Handler();
+  }
 }
 
 /**
@@ -653,14 +651,23 @@ void CAN_Safe_Transmit(uint32_t target_can_id, uint32_t payload_data, msg_type_t
       break;
     case MSG_TYPE_SYNC_REQUIRED:
       frame_to_send.msg_type = MSG_TYPE_SYNC_REQUIRED;
+      frame_to_send.payload_data[0] = (uint8_t)(payload_data & 0xFF);
+      frame_to_send.payload_data[1] = (uint8_t)((payload_data >> 8) & 0xFF);
+      frame_to_send.payload_data[2] = (uint8_t)((payload_data >> 16) & 0xFF);
+      frame_to_send.payload_data[3] = (uint8_t)((payload_data >> 24) & 0xFF);
       break;
     default:
       Error_Handler();
   }
-  ft_prepare_tx_frame(&frame_to_send, SLAVE1_ID); /* Master take SLAVE1_ID to avoid errors */
+  ft_prepare_tx_frame(&frame_to_send, target_can_id);
   // 3. Add data to the CAN payload
   memcpy(tx_data, &frame_to_send, sizeof(can_frame_payload_t));
   // 4. Transmit the message and check for errors
+  uint8_t timeout = 0;
+  while(HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0 && timeout < 10) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      timeout++;
+  }
   if (HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox) != HAL_OK) {
       // Podrías encender un LED de error de hardware aquí
       Error_Handler();
@@ -708,7 +715,7 @@ void vProcessDataTask(void *argument) {
 
   while(1) {
 
-    if (xQueueReceive(can_rx_queue, &msg_to_process, 0) == pdPASS) {
+    if (xQueueReceive(can_rx_queue, &msg_to_process, portMAX_DELAY) == pdPASS) {
       /* Determine the index of the slave based on its ID */
       uint8_t idx = 0;
       if (msg_to_process.sender_id == SLAVE1_ID) idx = 0;
@@ -716,6 +723,22 @@ void vProcessDataTask(void *argument) {
       else if (msg_to_process.sender_id == SLAVE3_ID) idx = 2;
       else continue; /* If the sender ID is not recognized, skip the rest of the processing */
       /* Process the message based on its type */
+      slave_contexts[idx].last_seen_ticks = xTaskGetTickCount();
+      if (slave_contexts[idx].is_muted) {
+        /* If the node is waiting for sync, we only process heartbeat messages to check if it has recovered */
+         if (msg_to_process.frame.msg_type != MSG_TYPE_HEARTBEAT) {
+           continue; /* Skip non-heartbeat messages if the node is waiting for sync */
+         }
+      }
+      if(slave_contexts[idx].waiting_for_sync) {
+        /* If we are waiting for sync, we only process messages to check if the slave has resynced correctly */
+        if (msg_to_process.frame.seq_number != 0) {
+          continue; /* Skip non-SYNC_REQUIRED messages if we are waiting for sync */
+        }
+        else{
+          slave_contexts[idx].waiting_for_sync = 0; /* If we receive a message with seq_number 0, it means the slave has resynced correctly */
+        }
+      }
       if (msg_to_process.frame.msg_type == MSG_TYPE_HEARTBEAT) {
         /* Analyze the first byte sent by the slave with the HC-SR04 status */
         if (msg_to_process.frame.payload_data[0] == 0x01) {
@@ -725,9 +748,9 @@ void vProcessDataTask(void *argument) {
           if (slave_contexts[idx].hardware_fault || slave_contexts[idx].is_muted) {
             Reset_Slave_Context(idx);
           }
-          /* Update the last seen timestamp */
-          slave_contexts[idx].last_seen_ticks = xTaskGetTickCount();
-          slave_contexts[idx].is_muted = 0;
+          else {
+            slave_contexts[idx].expected_seq_num = (msg_to_process.frame.seq_number + 1) % 256;
+          }
         }
       } 
       else if (msg_to_process.frame.msg_type == MSG_TYPE_RADAR_DATA) {
@@ -739,7 +762,6 @@ void vProcessDataTask(void *argument) {
         }
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(150));
   }
 }
 
@@ -760,7 +782,7 @@ void vWatchdogTask(void *argument) {
         }
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(1000)); /* Revisa cada 1 segundo */
+    vTaskDelay(pdMS_TO_TICKS(1000)); 
   }
 }
 
@@ -787,7 +809,7 @@ void print_at_anyfont(uint16_t x, uint16_t y, char* text) {
  * @retval None
  */
 void Reset_Slave_Context(uint8_t index) {
-  slave_contexts[index].is_muted = !slave_contexts[0].is_muted;
+  slave_contexts[index].is_muted = 0;
   slave_contexts[index].stats_crc_errors = 0;
   slave_contexts[index].stats_frames_lost = 0;
   slave_contexts[index].stats_frames_ok = 0;
@@ -796,6 +818,7 @@ void Reset_Slave_Context(uint8_t index) {
   slave_contexts[index].sync_attempts = 0;
   slave_contexts[index].expected_seq_num = 0;
   slave_contexts[index].hardware_fault = 0;
+  slave_contexts[index].waiting_for_sync = 0;
   slave_contexts[index].last_seen_ticks = xTaskGetTickCount();
   memset(slave_contexts[index].last_valid_data, 0, sizeof(uint32_t));
   if (!slave_contexts[0].is_muted) {
@@ -968,7 +991,7 @@ void vUpdateDisplayTask(void *argument) {
       }
     }
     /* Refresh control (5 Hz)*/
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
@@ -1026,4 +1049,12 @@ void assert_failed(uint8_t *file, uint32_t line)
 void CAN1_RX0_IRQHandler(void)
 {
   HAL_CAN_IRQHandler(&hcan1);
+}
+
+/**
+ * @brief Callback que salta cuando el hardware CAN sufre un error físico grave
+ */
+void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *hcan) {
+    HAL_CAN_ResetError(hcan);
+    HAL_CAN_ActivateNotification(hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
 }

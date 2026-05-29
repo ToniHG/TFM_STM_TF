@@ -41,14 +41,14 @@ extern TIM_HandleTypeDef htim2;
 #define RADAR_ANGLE_MIN         (0U)       /* Minimum angle for scanning */
 #define RADAR_ANGLE_MAX         (180U)     /* Maximum angle for scanning */
 #define SERVO_SETTLE_MS         (80U)      /* Stabilization time */
-#define RADAR_TASK_PERIOD_MS    (50U)     /* Radar task period */
+#define RADAR_TASK_PERIOD_MS    (250U)     /* Radar task period */
 /* --- ULTRASONIC    --- */
 #define HCSR04_TIM              TIM2
 #define HCSR04_TIM_CHANNEL      TIM_CHANNEL_2
 #define HCSR04_GPIO_PORT        GPIOA
 #define HCSR04_TRIG_PIN         GPIO_PIN_2
 #define HCSR04_ECHO_TIMEOUT_MS  (30U)      /* Timeout for echo signal (5 m) */
-#define HCSR04_MAX_DIST_CM      (400U)
+#define HCSR04_MAX_DIST_CM      (500U)
 #define HCSR04_INVALID_DIST     (0xFFFFU)
 /* Binary semaphore for synchronizing the capture ISR with the task */
 static SemaphoreHandle_t xEchoSemaphore = NULL;

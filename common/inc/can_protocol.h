@@ -37,7 +37,7 @@ typedef struct __attribute__((packed)) {
 
 /* Structure for RTOS CAN messages */
 typedef struct {
-    uint8_t sender_id;
+    uint32_t sender_id;
     can_frame_payload_t frame;
 } rtos_can_msg_t;
 

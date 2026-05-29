@@ -10,7 +10,7 @@ ft_context_t slave_contexts[3];
 void ft_init_context() {
     for(int i = 0; i < 3; i++) {
         memset(&slave_contexts[i], 0, sizeof(ft_context_t)); // Initialize all fields to zero
-        slave_contexts[i].slave_id = SLAVE1_ID + i; // Assign CAN IDs to the contexts
+        slave_contexts[i].slave_id = SLAVE1_ID + i; // Assign CAN IDs to the contexts (assumes SLAVE1_ID, SLAVE2_ID, SLAVE3_ID are consecutive)
     }
 }
 
@@ -30,7 +30,7 @@ ft_status_t ft_prepare_tx_frame(can_frame_payload_t *frame, uint32_t can_id) {
 
     /* Assign the current sequence number and prepare the next one (Algorithm 1) */
     frame->seq_number = ctx->expected_seq_num;
-    ctx->expected_seq_num++; 
+    ctx->expected_seq_num = (ctx->expected_seq_num + 1) % 256; // Wrap-around for uint8_t
 
     /* Calculate the length of the data to be CRC'd */
     size_t data_length = sizeof(can_frame_payload_t) - sizeof(uint16_t);
@@ -44,7 +44,7 @@ ft_status_t ft_prepare_tx_frame(can_frame_payload_t *frame, uint32_t can_id) {
 ft_status_t ft_process_message(can_frame_payload_t *frame, uint32_t can_id) {
 
     int idx = get_slave_index(can_id);
-    if (idx < 0) return FT_ERR_FRAME_LOST;      // If the CAN ID is not recognized, we consider it as a lost frame (or you could define another error code)
+    if (idx < 0) return FT_ERR_UNKNOWN_ID;      // If the CAN ID is not recognized, return unknown ID error
 
     ft_context_t *ctx = &slave_contexts[idx];   // Get the context for this slave
 
@@ -71,11 +71,6 @@ ft_status_t ft_process_message(can_frame_payload_t *frame, uint32_t can_id) {
     /* Reset consecutive CRC errors */
     ctx->consecutive_crc_errors = 0;
 
-    /* Check sensor data credibility */
-    //if (frame->payload_data > SENSOR_MAX_VALID) {
-    //    return FT_ERR_CREDIBILITY;
-    //}
-
     /* Check sequence number */
     if (frame->seq_number != ctx->expected_seq_num) {
         ctx->stats_frames_lost++;
@@ -93,6 +88,7 @@ ft_status_t ft_process_message(can_frame_payload_t *frame, uint32_t can_id) {
                 ctx->stats_frames_lost = 0; // Reset counter after reaching the threshold
                 ctx->expected_seq_num = 0;  // Reset expected sequence number
                 ctx->consecutive_seq_errors = 0;
+                ctx->waiting_for_sync = 1;   // Set flag to indicate we are waiting for sync
                 return FT_SYNC_REQUIRED;
             }
         }
@@ -103,6 +99,7 @@ ft_status_t ft_process_message(can_frame_payload_t *frame, uint32_t can_id) {
             ctx->expected_seq_num = 0;  // Reset expected sequence number
             ctx->consecutive_seq_errors = 0;
             ctx->sync_attempts++;
+            ctx->waiting_for_sync = 1;   // Set flag to indicate we are waiting for sync
             return FT_SYNC_REQUIRED; 
         }
     }
@@ -111,7 +108,7 @@ ft_status_t ft_process_message(can_frame_payload_t *frame, uint32_t can_id) {
         ctx->stats_frames_ok++;
     }
     /* No errors, update the expected sequence number and save the valid data */
-    ctx->expected_seq_num = (frame->seq_number + 1); 
+    ctx->expected_seq_num = (frame->seq_number + 1) % 256; 
     /* Copy up to 4 bytes of payload into last_valid_data (payload_data is a pointer) */
     memcpy(&ctx->last_valid_data, &frame->payload_data, sizeof(ctx->last_valid_data));
 
